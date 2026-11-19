@@ -1,0 +1,9 @@
+{
+  "_comment": "Governed catalog source: only agents listed here are indexed by the Agent Registry.",
+  "agents": [
+    {"agent_id": "it-helpdesk", "port": 18101, "owner": "IT Service Desk", "lifecycle": "active"},
+    {"agent_id": "report-analyst", "port": 18102, "owner": "Analytics", "lifecycle": "active"},
+    {"agent_id": "expense-approver", "port": 18103, "owner": "Finance", "lifecycle": "active"},
+    {"agent_id": "security-forensics", "port": 18104, "owner": "SecOps", "lifecycle": "active"}
+  ]
+}

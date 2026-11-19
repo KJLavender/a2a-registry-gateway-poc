@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+var/
+
+# downloaded agentgateway binary and its generated session key
+bin/
+config.session.key
+
+# planning notes stay local
+PLAN.md
+PLANS.md
+plan.md
+*-plan.md
+*_plan.md
+plans/

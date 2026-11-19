@@ -1,0 +1,39 @@
+{
+  "_comment": "Agent Gateway policy. Reloaded automatically when the file changes.",
+  "runtimes": {
+    "orchestrator-runtime": {"agent_id": "orchestrator", "tool_sets": ["basic", "multi_agent_delegation"]},
+    "report-runtime": {"agent_id": "report-analyst", "tool_sets": ["basic", "multi_agent_delegation"]},
+    "plain-runtime": {"agent_id": "plain-assistant", "tool_sets": ["basic"]}
+  },
+  "tool_sets": {
+    "basic": ["whoami"],
+    "multi_agent_delegation": ["search_agents", "invoke_agent", "provide_input", "cancel_task"]
+  },
+  "tool_call": {
+    "default": {"allow_groups": ["employees"]}
+  },
+  "agents": {
+    "it-helpdesk": {
+      "visibility": "listed",
+      "invoke": {"allow_groups": ["employees"]}
+    },
+    "report-analyst": {
+      "visibility": "listed",
+      "invoke": {"allow_groups": ["dept-analytics"], "allow_roles": ["report.read"]}
+    },
+    "expense-approver": {
+      "visibility": "listed",
+      "invoke": {"allow_roles": ["expense.approve"], "approval_groups": ["dept-finance"]}
+    },
+    "security-forensics": {
+      "visibility": "hidden",
+      "visible_to_groups": ["secops"],
+      "invoke": {"allow_groups": ["secops"]}
+    }
+  },
+  "delegation": {
+    "orchestrator": ["*"],
+    "report-analyst": ["it-helpdesk"],
+    "plain-assistant": []
+  }
+}

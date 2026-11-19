@@ -1,0 +1,25 @@
+{
+  "_comment": "Mock directory standing in for AD/Entra ID groups + Keycloak application roles. Dev only.",
+  "users": {
+    "alice": {"name": "Alice Chen", "groups": ["employees", "dept-analytics"], "roles": ["report.read"]},
+    "bob": {"name": "Bob Lin", "groups": ["employees", "dept-mfg"], "roles": []},
+    "carol": {"name": "Carol Wu", "groups": ["employees", "dept-finance"], "roles": ["expense.approve"]},
+    "dave": {"name": "Dave Huang", "groups": ["employees", "dept-finance"], "roles": []},
+    "erin": {"name": "Erin Kao", "groups": ["employees", "secops"], "roles": []}
+  },
+  "clients": {
+    "orchestrator-runtime": {"type": "runtime"},
+    "plain-runtime": {"type": "runtime"},
+    "report-runtime": {"type": "runtime"},
+    "agent-gateway": {
+      "type": "service",
+      "secret": "gateway-dev-secret",
+      "exchange": {"from": ["agent-gateway"], "to": ["agent-registry", "agent:*"]}
+    },
+    "agent-registry": {
+      "type": "service",
+      "secret": "registry-dev-secret",
+      "exchange": {"from": ["agent-registry"], "to": ["agent-gateway"]}
+    }
+  }
+}
