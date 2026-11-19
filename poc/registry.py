@@ -11,6 +11,7 @@ which makes the authoritative policy decision.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import sqlite3
@@ -230,14 +231,22 @@ class AgentRegistry(McpServer):
 
     def _authenticate(self, req: Request) -> Principal | Response:
         try:
-            return Principal.from_claims(self.verify(req.bearer or "", "agent-registry"))
+            claims = self.verify(req.bearer or "", "agent-registry")
+            principal = Principal.from_claims(claims)
+            # agentgateway + Keycloak: the token has no origin_client and no act chain, so the gateway
+            # sends the runtime it validated as a header. Accept it only on tokens minted for the gateway.
+            header = req.headers.get("x-origin-client", "")
+            if header and claims.get("azp") == "agent-gateway" and not claims.get("origin_client") \
+                    and "act" not in claims:
+                principal = dataclasses.replace(principal, origin_claim=header)
+            return principal
         except TokenError as e:
             return Response(401, {"error": f"unauthorized: {e}"}, {"WWW-Authenticate": "Bearer"})
 
     # --- calls back into the gateway ------------------------------------------------
 
     def _gateway_headers(self, ctx: McpContext, sp: trace.Span) -> dict[str, str]:
-        token = self.exchanger.exchange(ctx.token, "agent-gateway")
+        token = self.exchanger.exchange(ctx.token, "agent-gateway", ctx.principal.origin_scope)
         return {"Authorization": f"Bearer {token}", "A2A-Version": A2A_VERSION, "traceparent": sp.traceparent}
 
     def _a2a(self, agent_id: str, method: str, params: dict[str, Any], ctx: McpContext, sp: trace.Span) -> Any:
@@ -262,7 +271,7 @@ class AgentRegistry(McpServer):
                    "provide_input": self._provide_input, "cancel_task": self._cancel}.get(name)
         if handler is None:
             raise RpcError(-32602, f"Unknown tool: {name}")
-        with trace.span(f"registry {name}", COMPONENT, ctx.traceparent, user=ctx.principal.sub) as sp:
+        with trace.span(f"registry {name}", COMPONENT, ctx.traceparent, user=ctx.principal.username) as sp:
             try:
                 return handler(arguments, ctx, sp)
             except RpcError as e:
@@ -272,7 +281,7 @@ class AgentRegistry(McpServer):
 
     def _whoami(self, args: dict[str, Any], ctx: McpContext, sp: trace.Span) -> dict[str, Any]:
         p = ctx.principal
-        return tool_result({"user": p.sub, "name": p.name, "groups": list(p.groups), "roles": list(p.roles),
+        return tool_result({"user": p.username, "name": p.name, "groups": list(p.groups), "roles": list(p.roles),
                             "runtime": p.origin_client, "caller_agent": self.policy.caller_agent(p.origin_client),
                             "delegation_path": list(p.actors)})
 

@@ -59,7 +59,7 @@ class GatewayMcp(McpServer):
             raise RpcError(-32602, f"Unknown tool: {name}")  # not distributed to this runtime
         p = ctx.principal
         with trace.span(f"gateway tools/call {name}", COMPONENT, ctx.traceparent,
-                        user=p.sub, runtime=p.origin_client) as sp:
+                        user=p.username, runtime=p.origin_client) as sp:
             decision = self.gw.policy.tool_call(p, name)
             sp.set(policy_effect=decision.effect, policy_rule=decision.rule, decision_id=decision.decision_id)
             if not decision.allowed:
@@ -83,7 +83,7 @@ class GatewayMcp(McpServer):
             raise RpcError(RESOURCE_NOT_FOUND, "Resource not found", {"uri": uri})
         agent_id, task_id, _ = parse_task_uri(uri)
         with trace.span("gateway resources/read", COMPONENT, ctx.traceparent,
-                        user=ctx.principal.sub, task_id=task_id) as sp:
+                        user=ctx.principal.username, task_id=task_id) as sp:
             if not self.gw.owns(ctx.principal, agent_id, task_id):
                 sp.set(policy_effect="deny", reason="not task owner")
                 raise RpcError(RESOURCE_NOT_FOUND, "Resource not found", {"uri": uri})
@@ -128,7 +128,7 @@ class AgentGateway:
     # --- MCP upstream (registry) ---------------------------------------------------
 
     def forward_mcp(self, method: str, params: dict[str, Any], ctx: McpContext, sp: trace.Span) -> Any:
-        token = self.exchanger.exchange(ctx.token, "agent-registry")
+        token = self.exchanger.exchange(ctx.token, "agent-registry", ctx.principal.origin_scope)
         params = dict(params, _meta={"traceparent": sp.traceparent})  # MCP SEP-414
         return rpc_call(f"{self.settings.registry_url}/mcp", method, params,
                         headers={"Authorization": f"Bearer {token}", "traceparent": sp.traceparent},
@@ -176,7 +176,7 @@ class AgentGateway:
         if isinstance(p, Response):
             return p
         with trace.span(f"gateway a2a {method}", COMPONENT, req.headers.get("traceparent"), agent_id=agent_id,
-                        user=p.sub, delegation_path=" > ".join(p.actors)) as sp:
+                        user=p.username, delegation_path=" > ".join(p.actors)) as sp:
             new_task = method == "SendMessage" and not (params.get("message") or {}).get("taskId")
             if new_task:
                 if not self.policy.visible(p, agent_id):
@@ -195,7 +195,7 @@ class AgentGateway:
                 if not self.owns(p, agent_id, task_id):
                     sp.set(policy_effect="deny", reason="not task owner")
                     return Response(200, rpc_response(rid, error=RpcError(TASK_NOT_FOUND, "task not found")))
-            agent_token = self.exchanger.exchange(req.bearer or "", f"agent:{agent_id}")
+            agent_token = self.exchanger.exchange(req.bearer or "", f"agent:{agent_id}", p.origin_scope)
             headers = {"Authorization": f"Bearer {agent_token}", "traceparent": sp.traceparent}
             if req.headers.get("a2a-version"):
                 headers["A2A-Version"] = req.headers["a2a-version"]
@@ -224,7 +224,7 @@ class AgentGateway:
             return p
         if p.immediate_actor != "agent-registry":
             return Response(403, {"error": "only the agent registry may call this endpoint"})
-        with trace.span("gateway access-check", COMPONENT, req.headers.get("traceparent"), user=p.sub) as sp:
+        with trace.span("gateway access-check", COMPONENT, req.headers.get("traceparent"), user=p.username) as sp:
             out = {agent_id: self.policy.access_indication(p, agent_id)
                    for agent_id in req.json().get("agent_ids", [])}
             sp.set(checked=len(out))

@@ -180,7 +180,8 @@ class A2AAgent:
         if handler is None:
             return Response(200, rpc_response(rid, error=RpcError(METHOD_NOT_FOUND, f"method {method} not found")))
         with trace.span(f"a2a {method}", self.component, req.headers.get("traceparent"),
-                        user=claims["sub"], delegation_path=" > ".join(actor_chain(claims))) as sp:
+                        user=claims.get("preferred_username", claims["sub"]), origin=claims.get("origin_client"),
+                        delegation_path=" > ".join(actor_chain(claims))) as sp:
             try:
                 result = handler(msg.get("params") or {}, claims, sp)
             except RpcError as e:

@@ -34,7 +34,8 @@ def setUpModule() -> None:
     shutil.copytree(ROOT / "config", _TMP / "config")
     agents = json.loads((_TMP / "config" / "agents.json").read_text(encoding="utf-8"))["agents"]
     SETTINGS = Settings(config_dir=_TMP / "config", var_dir=_TMP / "var",
-                        idp_port=free_port(), gateway_port=free_port(), registry_port=free_port(),
+                        idp_port=free_port() if Settings(agent_ports={"_": 0}).idp_impl == "mock" else 0,
+                        gateway_port=free_port(), registry_port=free_port(),
                         agent_ports={a["agent_id"]: free_port() for a in agents},
                         speed=0.5, resource_wait_seconds=4)
     STACK = start_stack(SETTINGS)
@@ -204,6 +205,13 @@ class Authorization(unittest.TestCase):
         self.assertEqual(result["effect"], "deny")
         if not AGW:  # agentgateway's 403 does not say which rule refused the call
             self.assertEqual(result["rule"], "delegation.report-analyst")
+
+    def test_origin_header_cannot_be_spoofed(self):
+        carol = mcp_for("carol", "report-runtime")
+        carol.extra_headers["x-origin-client"] = "orchestrator-runtime"  # pretend to be the orchestrator
+        result, is_error = carol.call_tool("invoke_agent", {"agent_id": "expense-approver", "message": "12000 元 差旅"})
+        self.assertTrue(is_error)
+        self.assertEqual(result["effect"], "deny")
 
     def test_approval_required(self):
         dave = mcp_for("dave")

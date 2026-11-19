@@ -20,12 +20,15 @@ def _list(values: list[str]) -> str:
 
 
 def origin_client(depth: int = 4) -> str:
-    """CEL: the client the user signed in with, found at the bottom of the RFC 8693 `act` chain."""
+    """CEL: the client the user signed in with.
+
+    Keycloak puts it in an `origin_client` claim; the mock IdP keeps an RFC 8693 `act` chain.
+    """
     def walk(path: str, remaining: int) -> str:
         if remaining == 0:
             return f"{path}.sub"
         return f"(has({path}.act) ? {walk(path + '.act', remaining - 1)} : {path}.sub)"
-    return f"(has(jwt.act) ? {walk('jwt.act', depth)} : jwt.azp)"
+    return f"(has(jwt.origin_client) ? jwt.origin_client : (has(jwt.act) ? {walk('jwt.act', depth)} : jwt.azp))"
 
 
 def user_rule(rule: dict[str, Any]) -> str:
@@ -89,7 +92,13 @@ def build(settings: Settings) -> dict[str, Any]:
          "policies": {"jwtAuth": jwt_auth, "mcpAuthorization": {"rules": mcp_rules(policy)}},
          "backends": [{"mcp": {"statefulMode": "stateless", "prefixMode": "never",
                                "targets": [{"name": "registry", "mcp": {"host": f"{settings.registry_url}/mcp"}}]},
-                       "policies": exchange("agent-registry")}]},
+                       "policies": {
+                           **exchange("agent-registry"),
+                           # Keycloak drops origin_client on exchange and agentgateway cannot request a
+                           # per-caller scope, so pass the runtime it validated as a header (overwrites
+                           # anything the client sent). The registry trusts it only on gateway tokens.
+                           "transformations": {"request": {"set": {"x-origin-client": origin_client()}}},
+                       }}]},
     ]
     for agent_id, port in settings.agent_ports.items():
         routes.append({

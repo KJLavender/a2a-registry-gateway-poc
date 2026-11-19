@@ -12,6 +12,7 @@ from poc.common.jwt import TokenError
 from poc.common.web import http
 from poc.settings import Settings
 
+DEV_PASSWORD = "dev-password"  # every demo user, in both the mock IdP and the Keycloak realm
 TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
@@ -58,14 +59,21 @@ def actor_chain(claims: dict[str, Any]) -> list[str]:
 @dataclass(frozen=True)
 class Principal:
     sub: str
+    username: str
     name: str
     groups: tuple[str, ...]
     roles: tuple[str, ...]
     actors: tuple[str, ...]  # most recent actor first; last item is the client the user signed in with
+    origin_claim: str = ""
 
     @property
     def origin_client(self) -> str:
-        return self.actors[-1] if self.actors else ""
+        """The runtime the user signed in with. Keycloak carries it as `origin_client` (no `act` chain)."""
+        return self.origin_claim or (self.actors[-1] if self.actors else "")
+
+    @property
+    def origin_scope(self) -> str:
+        return f"origin-{self.origin_client}"
 
     @property
     def immediate_actor(self) -> str:
@@ -73,8 +81,9 @@ class Principal:
 
     @classmethod
     def from_claims(cls, claims: dict[str, Any]) -> "Principal":
-        return cls(claims["sub"], claims.get("name", claims["sub"]), tuple(claims.get("groups", [])),
-                   tuple(claims.get("roles", [])), tuple(actor_chain(claims)))
+        username = claims.get("preferred_username", claims["sub"])
+        return cls(claims["sub"], username, claims.get("name", username), tuple(claims.get("groups", [])),
+                   tuple(claims.get("roles", [])), tuple(actor_chain(claims)), claims.get("origin_client", ""))
 
 
 class TokenExchanger:
@@ -84,11 +93,11 @@ class TokenExchanger:
         self.settings = settings
         self.client_id = client_id
         self.client_secret = settings.client_secret(client_id)
-        self._cache: dict[tuple[str, str], tuple[str, float]] = {}
+        self._cache: dict[tuple[str, str, str], tuple[str, float]] = {}
         self._lock = threading.Lock()
 
-    def exchange(self, subject_token: str, audience: str) -> str:
-        key = (hashlib.sha256(subject_token.encode()).hexdigest(), audience)
+    def exchange(self, subject_token: str, audience: str, scope: str = "") -> str:
+        key = (hashlib.sha256(subject_token.encode()).hexdigest(), audience, scope)
         with self._lock:
             cached = self._cache.get(key)
         if cached and cached[1] - 30 > time.time():
@@ -100,6 +109,7 @@ class TokenExchanger:
             "subject_token": subject_token,
             "subject_token_type": ACCESS_TOKEN_TYPE,
             "audience": audience,
+            **({"scope": scope} if scope else {}),
         })
         if status != 200:
             raise TokenError(f"token exchange to {audience} failed: {body}")
@@ -111,8 +121,8 @@ class TokenExchanger:
 
 def login(settings: Settings, username: str, client_id: str) -> str:
     """Dev-only stand-in for the SSO login a frontend would do against Keycloak."""
-    status, body, _ = http("POST", settings.token_endpoint,
-                           form={"grant_type": "password", "username": username, "client_id": client_id})
+    status, body, _ = http("POST", settings.token_endpoint, form={
+        "grant_type": "password", "username": username, "password": DEV_PASSWORD, "client_id": client_id})
     if status != 200:
         raise TokenError(f"login failed: {body}")
     return body["access_token"]

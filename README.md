@@ -22,6 +22,7 @@ Agent Registry :18200   MCP server: search_agents, invoke_agent, provide_input,
         ▼
 Agent Gateway ──► A2A agents :18101-18104 (A2A 1.0, JSON-RPC)
 Mock IdP :18300  stands in for Keycloak (RS256 JWT, JWKS, RFC 8693 token exchange)
+Keycloak :18080  optional, the real thing (keycloak/docker-compose.yml)
 ```
 
 | Path | What it does |
@@ -32,8 +33,9 @@ Mock IdP :18300  stands in for Keycloak (RS256 JWT, JWKS, RFC 8693 token exchang
 | `poc/policy.py` + `config/policy.json` | Policy rules. The file is reloaded when it changes |
 | `poc/agents/` | A2A 1.0 server and four demo agents (IT helpdesk, KPI report analyst, expense approver, hidden security forensics) |
 | `poc/idp.py` + `config/users.json` | Fake users, groups and roles; token exchange rules |
+| `poc/keycloak_realm.py` + `keycloak/` | Keycloak realm generated from the same config, and a compose file to run it |
 | `poc/common/trace.py` | W3C trace context across every hop, written to `var/traces.jsonl` |
-| `tests/test_acceptance.py` | 19 acceptance tests: discovery, authorization, async tasks, tracing |
+| `tests/test_acceptance.py` | 20 acceptance tests: discovery, authorization, async tasks, tracing |
 
 All agent data is simulated. No real system is touched.
 
@@ -41,7 +43,7 @@ All agent data is simulated. No real system is touched.
 
 ```bash
 python -m poc demo          # runs 10 scenarios and prints one full trace
-python -m unittest -v       # 19 acceptance tests, about 10 seconds
+python -m unittest -v       # 20 acceptance tests, about 10 seconds
 ```
 
 What the demo shows:
@@ -104,7 +106,7 @@ How the policy maps:
 - Each agent gets an A2A route with an `authorization` CEL rule: visibility, delegation (the runtime is read from the bottom of the token's `act` chain), and the user's groups or roles.
 - Token exchange uses the built-in `backendAuth.oauthTokenExchange` against the mock IdP.
 
-All 19 tests pass with both gateways. Where they differ, the tests check what each one actually does:
+All 20 tests pass with both gateways. Where they differ, the tests check what each one actually does:
 
 | Behavior | Built-in gateway | agentgateway |
 |---|---|---|
@@ -118,6 +120,25 @@ All 19 tests pass with both gateways. Where they differ, the tests check what ea
 
 Claude Code also worked through agentgateway in our run: `search_agents`, `invoke_agent`, then one resource read.
 
+## Use a real Keycloak
+
+`keycloak/docker-compose.yml` runs Keycloak 26.8.2 on `127.0.0.1:18080` and imports realm `poc` from `keycloak/realm-poc.json`. That file is generated from `config/users.json` and `config/policy.json` (`python -m poc.keycloak_realm`), so users, groups, roles and clients match the mock IdP. Every demo user's password is `dev-password`.
+
+```bash
+docker compose -f keycloak/docker-compose.yml up -d     # with Docker in WSL: run it inside WSL
+POC_IDP=keycloak python -m poc demo
+POC_IDP=keycloak POC_GATEWAY=agentgateway python -m unittest -v
+```
+
+What we learned wiring it up:
+
+- Keycloak's standard token exchange (GA) does not add an `act` claim, and the exchanged token's `azp` becomes the service that asked for it. After the first hop nothing in the token says which runtime started the request, which the delegation policy needs. Keycloak's delegation support (`token-exchange-delegation`) is still a preview feature.
+- The PoC keeps the starting runtime with GA features only. Each runtime has an `origin-<runtime>` client scope that adds an `origin_client` claim. The registry and the built-in gateway ask for that scope on every exchange, so the claim survives every hop.
+- agentgateway cannot ask for a scope that depends on the caller: `scope` is not allowed in `additionalParams`, and its `scopes` field is fixed. So on its hop to the registry it sends the runtime it validated in an `x-origin-client` header. It overwrites whatever the client sent, and the registry only accepts the header on tokens minted for the gateway (`azp=agent-gateway`) that carry no origin of their own. A test checks that a client cannot spoof it.
+- Keycloak refuses to give the registry a token for an agent (`Requested audience not available`), because only the gateway has those audiences. That is the same rule the mock IdP enforces.
+
+All 20 tests pass in all four combinations: mock IdP or Keycloak, built-in gateway or agentgateway. Claude Code also worked against Keycloak + agentgateway; with `whoami` it reported the identity the gateway saw.
+
 ## Optional: real LLM answers
 
 Agents use canned text by default so tests stay stable. With `POC_LLM=claude`, agents write their answers and the demo runtime picks agents through the local `claude` CLI (your Claude subscription, no API key). `POC_LLM_MODEL` picks the model, default `sonnet`.
@@ -128,6 +149,7 @@ Agents use canned text by default so tests stay stable. With `POC_LLM=claude`, a
 |---|---|---|
 | `POC_SPEED` | `1.0` | Multiplier for simulated agent work time |
 | `POC_RESOURCE_WAIT` | `20` | Max seconds one task resource read waits; keep it below your MCP client's timeout |
+| `POC_IDP` | `mock` | `keycloak` to use Keycloak on port 18080 instead of the mock IdP |
 | `POC_GATEWAY` | `builtin` | `agentgateway` to use the agentgateway binary instead of `poc/gateway.py` |
 | `POC_AGENTGATEWAY_BIN` | `bin/agentgateway-windows-amd64.exe` | Path to the agentgateway binary |
 
@@ -135,7 +157,7 @@ Ports are set in `poc/settings.py` and `config/agents.json`. agentgateway also o
 
 ## What this PoC does not do
 
-- The IdP is a stand-in. It signs RS256 tokens and publishes a JWKS like Keycloak, but logins do not check passwords and the signing key is generated into `var/`.
+- The mock IdP is a stand-in. It signs RS256 tokens and publishes a JWKS like Keycloak, but logins do not check passwords and the signing key is generated into `var/`. The Keycloak setup is dev mode with fixed passwords and secrets.
 - Search is keyword-based (BM25 with Chinese bigrams), not embeddings. The `search_agents` contract would stay the same if it were swapped.
 - The gateway keeps task ownership in memory. After a restart, old task resources are refused until the task is recreated. The registry's correlation table survives restarts.
 - No streaming, push notifications, MCP Tasks, or approval workflow. An approval request only gets an id.

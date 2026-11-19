@@ -15,7 +15,9 @@ class Settings:
     config_dir: Path = ROOT / "config"
     var_dir: Path = ROOT / "var"
     host: str = "127.0.0.1"
-    idp_port: int = 18300
+    # "mock" = poc/idp.py; "keycloak" = Keycloak from keycloak/docker-compose.yml
+    idp_impl: str = field(default_factory=lambda: os.environ.get("POC_IDP", "mock"))
+    idp_port: int = 0  # 0 = default for idp_impl (mock 18300, keycloak 18080)
     gateway_port: int = 18000
     registry_port: int = 18200
     agent_ports: dict[str, int] = field(default_factory=dict)
@@ -29,6 +31,8 @@ class Settings:
     resource_wait_seconds: float = field(default_factory=lambda: float(os.environ.get("POC_RESOURCE_WAIT", "20")))
 
     def __post_init__(self) -> None:
+        if not self.idp_port:
+            self.idp_port = 18080 if self.idp_impl == "keycloak" else 18300
         if not self.agent_ports:
             self.agent_ports = {a["agent_id"]: a["port"] for a in self.load("agents.json")["agents"]}
 

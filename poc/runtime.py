@@ -38,12 +38,14 @@ class McpClient:
         self.token = token
         self.protocol_version = protocol_version
         self.session_id: str | None = None
+        self.extra_headers: dict[str, str] = {}
 
     def _post(self, payload: dict[str, Any], timeout: float) -> tuple[int, Any, dict[str, str]]:
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json, text/event-stream",
                    "MCP-Protocol-Version": self.protocol_version}
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
+        headers.update(self.extra_headers)
         return http("POST", self.url, json_body=payload, headers=headers, timeout=timeout)
 
     def request(self, method: str, params: dict[str, Any] | None = None, *, traceparent: str | None = None,

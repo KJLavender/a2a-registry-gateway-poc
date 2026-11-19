@@ -57,6 +57,16 @@ def _wait_healthy(url: str, proc: subprocess.Popen, timeout: float = 30) -> None
     raise RuntimeError("agentgateway did not become healthy; see var/agentgateway.log")
 
 
+def _require_keycloak(settings: Settings) -> None:
+    try:
+        status = http("GET", f"{settings.issuer}/.well-known/openid-configuration", timeout=3)[0]
+    except OSError:
+        status = 0
+    if status != 200:
+        raise RuntimeError(f"Keycloak realm not reachable at {settings.issuer}. Start it with: "
+                           "docker compose -f keycloak/docker-compose.yml up -d")
+
+
 def _start_agentgateway(settings: Settings) -> subprocess.Popen:
     if not settings.agentgateway_bin.exists():
         raise FileNotFoundError(f"agentgateway binary not found at {settings.agentgateway_bin}")
@@ -81,7 +91,11 @@ def _regenerate_on_policy_change(stack: Stack) -> None:
 def start_stack(settings: Settings) -> Stack:
     settings.var_dir.mkdir(parents=True, exist_ok=True)
     trace.configure(settings.trace_file)
-    servers = [serve(make_app(IdentityProvider(settings)), settings.host, settings.idp_port)]
+    if settings.idp_impl == "keycloak":
+        _require_keycloak(settings)
+        servers = []
+    else:
+        servers = [serve(make_app(IdentityProvider(settings)), settings.host, settings.idp_port)]
     verify = make_verifier(settings)
 
     agents = build_agents(verify, settings.speed)
