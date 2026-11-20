@@ -25,7 +25,7 @@ from typing import Any
 
 from poc.approvals import ApprovalStore
 from poc.common import trace
-from poc.common.a2a import POLICY_DENIED, TASK_NOT_FOUND
+from poc.common.a2a import POLICY_DENIED, TASK_NOT_FOUND, camel_keys
 from poc.common.identity import Principal, TokenExchanger, Verifier
 from poc.common.jwt import TokenError
 from poc.common.mcp import RESOURCE_NOT_FOUND, McpContext, McpServer, serve_mcp, tool_result
@@ -187,7 +187,10 @@ class AgentGateway:
             msg = req.json()
         except ValueError:
             return Response(400, rpc_response(None, error=RpcError(-32700, "parse error")))
-        rid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+        if not isinstance(msg, dict):
+            return Response(400, rpc_response(None, error=RpcError(-32600, "invalid request")))
+        msg = dict(msg, params=camel_keys(msg.get("params") or {}))  # check and forward one spelling
+        rid, method, params = msg.get("id"), msg.get("method"), msg["params"]
         p = self._authenticate(req)
         if isinstance(p, Response):
             return p

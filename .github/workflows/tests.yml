@@ -71,3 +71,65 @@ jobs:
       - name: Keycloak logs on failure
         if: failure()
         run: docker compose -f keycloak/docker-compose.yml logs --tail 200
+
+  extras:
+    name: semantic search + A2A SDK agent / ${{ matrix.gateway }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        gateway: [builtin, agentgateway]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: .cache/fastembed
+          key: fastembed-paraphrase-multilingual-MiniLM-L12-v2
+      - name: Install optional packages
+        run: pip install -r requirements-extras.txt
+      - name: Download agentgateway
+        if: matrix.gateway == 'agentgateway'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/get-agentgateway.sh
+      - name: Run tests (semantic search must be active)
+        env:
+          POC_GATEWAY: ${{ matrix.gateway }}
+          POC_SEARCH: hybrid
+        run: python -m unittest -v
+
+  a2a-tck:
+    name: A2A TCK (JSON-RPC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TCK_COMMIT: 5e6f37c2d38eb3d7684686243c34d365c83df49b
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - name: Get the A2A TCK
+        run: |
+          git clone https://github.com/a2aproject/a2a-tck.git "$RUNNER_TEMP/a2a-tck"
+          git -C "$RUNNER_TEMP/a2a-tck" checkout "$TCK_COMMIT"
+          cd "$RUNNER_TEMP/a2a-tck" && uv venv --python 3.15 && uv pip install -e .
+      - name: Start the system under test
+        run: |
+          python -m poc.tck_sut --port 18199 &
+          for i in $(seq 1 30); do curl -fs http://127.0.0.1:18199/.well-known/agent-card.json > /dev/null && exit 0; sleep 1; done
+          exit 1
+      - name: Run the TCK
+        run: cd "$RUNNER_TEMP/a2a-tck" && .venv/bin/python run_tck.py --sut-host http://127.0.0.1:18199 --transport jsonrpc
+      - name: Keep the TCK report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a2a-tck-report
+          path: ${{ runner.temp }}/a2a-tck/reports

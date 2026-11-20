@@ -404,6 +404,17 @@
             "introspection.token.claim": "true",
             "included.client.audience": "agent:security-forensics"
           }
+        },
+        {
+          "name": "aud-agent:hr-leave",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "included.client.audience": "agent:hr-leave"
+          }
         }
       ]
     },
@@ -497,6 +508,15 @@
     },
     {
       "clientId": "agent:security-forensics",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "defaultClientScopes": [],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "agent:hr-leave",
       "enabled": true,
       "publicClient": false,
       "standardFlowEnabled": false,

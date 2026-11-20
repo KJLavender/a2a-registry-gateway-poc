@@ -90,7 +90,7 @@ class LeaveExecutor(AgentExecutor):
             history = [p.text for m in (context.current_task.history if context.current_task else [])
                        for p in m.parts if p.text]
             text = " ".join([*history, context.get_user_input()])
-            wants_leave = any(w in text for w in ("請假", "請一天", "病假", "事假", "time off", "leave request"))
+            wants_leave = any(w in text for w in ("請假", "休假", "休息", "病假", "事假", "day off", "time off", "leave request"))
             dates = list(dict.fromkeys(_DATES.findall(text)))  # history repeats earlier messages
             if wants_leave and not dates:
                 sp.set(outcome="input_required")

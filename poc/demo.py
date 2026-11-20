@@ -65,6 +65,11 @@ def run(settings: Settings, only: str | None = None) -> None:
         approval_id = first.detail.get("approval_request_id")
         if not approval_id:
             return
+        status, inbox, _ = http("GET", f"{settings.pdp_url}/notifications",
+                                headers={"Authorization": f"Bearer {login(settings, 'carol', 'orchestrator-runtime')}"})
+        for note in (inbox or {}).get("notifications", []) if status == 200 else []:
+            if note["approval_id"] == approval_id:
+                print(f"  carol 收到通知：{note['text']}")
         for user in ("dave", "carol"):
             status, body, _ = http("POST", f"{settings.pdp_url}/approvals/{approval_id}/approve",
                                    headers={"Authorization": f"Bearer {login(settings, user, 'orchestrator-runtime')}"})
@@ -83,6 +88,17 @@ def run(settings: Settings, only: str | None = None) -> None:
     scenario("9", "取消：明確的 cancel_task（Resource 讀取逾時不會取消 Task）", cancel)
     scenario("10", "失敗：Agent 端出錯會成為 FAILED，不會被壓扁成一般文字",
              lambda: _show(runtime.ask(settings, "alice", "分析晨會報表 #fail")))
+
+    def sdk_agent() -> None:
+        try:
+            import a2a  # noqa: F401  (the hr-leave agent runs only when the SDK is installed)
+        except ImportError:
+            print("  需要選用套件：pip install -r requirements-extras.txt")
+            return
+        _show(runtime.ask(settings, "bob", "下禮拜想休息兩天", answers=["12/3-12/4"]))
+
+    scenario("11", "官方 A2A SDK 寫的 Agent（人資請假）一樣被找到、被管控；這句話跟 Agent Card 沒有共同關鍵字",
+             sdk_agent)
 
     if report_trace:
         _section("情境 2 的端到端 Trace（Frontend → Runtime → Gateway → Registry → Gateway → Agent）")

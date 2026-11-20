@@ -26,7 +26,9 @@ ROLE_AGENT = "ROLE_AGENT"
 # JSON-RPC error codes (A2A spec §5.4)
 TASK_NOT_FOUND = -32001
 TASK_NOT_CANCELABLE = -32002
+PUSH_NOT_SUPPORTED = -32003
 UNSUPPORTED_OPERATION = -32004
+CONTENT_TYPE_NOT_SUPPORTED = -32005
 VERSION_NOT_SUPPORTED = -32009
 INVALID_PARAMS = -32602
 METHOD_NOT_FOUND = -32601
@@ -57,11 +59,26 @@ def message_text(message: dict[str, Any] | None) -> str:
     return "\n".join(p["text"] for p in message.get("parts", []) if "text" in p)
 
 
+def camel_keys(value: Any) -> Any:
+    """Proto3 JSON lets clients send original field names (history_length) as well as lowerCamelCase
+    (historyLength). Normalize request params to camelCase; free-form `data` and `metadata` stay as sent."""
+    if isinstance(value, list):
+        return [camel_keys(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    out = {}
+    for key, v in value.items():
+        head, *rest = key.split("_")
+        name = head + "".join(w[:1].upper() + w[1:] for w in rest) if rest and head else key
+        out[name] = v if name in ("data", "metadata") else camel_keys(v)
+    return out
+
+
 def is_new_task(rpc: Any) -> bool:
     """A2A SendMessage without a taskId starts a new task; with one it continues an existing task."""
     if not isinstance(rpc, dict) or rpc.get("method") != "SendMessage":
         return False
-    params = rpc.get("params")
+    params = camel_keys(rpc.get("params"))  # task_id and taskId must mean the same thing everywhere
     message = params.get("message") if isinstance(params, dict) else None
     return not (isinstance(message, dict) and message.get("taskId"))
 

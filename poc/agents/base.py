@@ -6,15 +6,18 @@ Gateway obtained through token exchange. A user's own token is rejected here.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import threading
 import time
 from typing import Any, Callable
 
 from poc.common import trace
 from poc.common.a2a import (
-    A2A_VERSION, CANCELED, COMPLETED, FAILED, INPUT_REQUIRED, INTERRUPTED, INVALID_PARAMS,
-    METHOD_NOT_FOUND, ROLE_AGENT, SUBMITTED, TASK_NOT_CANCELABLE, TASK_NOT_FOUND, TERMINAL,
-    UNSUPPORTED_OPERATION, VERSION_NOT_SUPPORTED, WORKING, message_text, new_id, now_iso, text_message,
+    A2A_VERSION, CANCELED, COMPLETED, CONTENT_TYPE_NOT_SUPPORTED, FAILED, INPUT_REQUIRED, INTERRUPTED,
+    INVALID_PARAMS, METHOD_NOT_FOUND, PUSH_NOT_SUPPORTED, REJECTED, ROLE_AGENT, SUBMITTED, TASK_NOT_CANCELABLE,
+    TASK_NOT_FOUND, TERMINAL, UNSUPPORTED_OPERATION, VERSION_NOT_SUPPORTED, WORKING, camel_keys, message_text,
+    new_id, now_iso, text_message,
 )
 from poc.common.identity import Verifier, actor_chain
 from poc.common.jwt import TokenError
@@ -24,10 +27,23 @@ from poc.common.web import Request, Response, RpcError, rpc_response
 BLOCKING_SEND_LIMIT = 60.0
 # Orphan protection: a task waiting for input fails after this many seconds.
 INPUT_WAIT_LIMIT = 300.0
+# A2A 1.0 methods this server knows but does not offer (no streaming, push or extended card)
+_NOT_OFFERED = {
+    "SendStreamingMessage": (UNSUPPORTED_OPERATION, "streaming is not supported"),
+    "SubscribeToTask": (UNSUPPORTED_OPERATION, "streaming is not supported"),
+    "GetExtendedAgentCard": (UNSUPPORTED_OPERATION, "there is no extended agent card"),
+    **{m: (PUSH_NOT_SUPPORTED, "push notifications are not supported") for m in (
+        "CreateTaskPushNotificationConfig", "GetTaskPushNotificationConfig",
+        "ListTaskPushNotificationConfigs", "DeleteTaskPushNotificationConfig")},
+}
 
 
 class TaskCanceled(Exception):
     pass
+
+
+class TaskRejected(Exception):
+    """Raised by a handler that will not do the task at all (TASK_STATE_REJECTED, not FAILED)."""
 
 
 class TaskRecord:
@@ -87,6 +103,10 @@ class TaskContext:
         return message_text(self._rec.task["history"][0])
 
     @property
+    def message(self) -> dict[str, Any]:
+        return self._rec.task["history"][0]
+
+    @property
     def user(self) -> str:
         return self._rec.owner
 
@@ -109,8 +129,9 @@ class TaskContext:
         rec.set_state(WORKING, "已收到補充資訊，繼續處理")
         return answer
 
-    def artifact(self, name: str, *, text: str | None = None, data: Any = None, description: str = "") -> None:
-        parts: list[dict[str, Any]] = []
+    def artifact(self, name: str, *, text: str | None = None, data: Any = None, description: str = "",
+                 parts: list[dict[str, Any]] | None = None) -> None:
+        parts = list(parts or [])
         if text:
             parts.append({"text": text})
         if data is not None:
@@ -132,12 +153,15 @@ class TaskContext:
 
 
 Handler = Callable[[TaskContext], str]
+# Optional: answer a new message directly with a Message (no task) by returning one; None = make a task
+DirectReply = Callable[[dict[str, Any]], "dict[str, Any] | None"]
 
 
 class A2AAgent:
     def __init__(self, agent_id: str, card: dict[str, Any], handler: Handler, verify: Verifier, speed: float = 1.0,
-                 verify_txn: Callable[[str], dict[str, Any]] | None = None):
+                 verify_txn: Callable[[str], dict[str, Any]] | None = None, direct_reply: DirectReply | None = None):
         self.agent_id = agent_id
+        self.direct_reply = direct_reply
         self.card_template = card
         self.handler = handler
         self.verify = verify
@@ -156,8 +180,12 @@ class A2AAgent:
 
     def __call__(self, req: Request) -> Response:
         if req.method == "GET" and req.path == "/.well-known/agent-card.json":
-            return Response(200, self.agent_card())
-        if req.method == "POST" and req.path == "/a2a":
+            card = self.agent_card()
+            etag = '"' + hashlib.sha256(json.dumps(card, sort_keys=True).encode()).hexdigest()[:32] + '"'
+            if req.headers.get("if-none-match") == etag:
+                return Response(304, None, {"ETag": etag})
+            return Response(200, card, {"Cache-Control": "public, max-age=300", "ETag": etag})
+        if req.method == "POST" and req.path in ("/a2a", "/a2a/"):
             return self._rpc(req)
         return Response(404, {"error": "not found"})
 
@@ -182,6 +210,8 @@ class A2AAgent:
         method = msg.get("method")
         handler = {"SendMessage": self._send, "GetTask": self._get,
                    "CancelTask": self._cancel, "ListTasks": self._list}.get(method)
+        if method in _NOT_OFFERED:
+            return Response(200, rpc_response(rid, error=RpcError(*_NOT_OFFERED[method])))
         if handler is None:
             return Response(200, rpc_response(rid, error=RpcError(METHOD_NOT_FOUND, f"method {method} not found")))
         with trace.span(f"a2a {method}", self.component, req.headers.get("traceparent"),
@@ -189,7 +219,7 @@ class A2AAgent:
                         origin=txn.get("tctx", {}).get("origin_client"), txn=txn.get("txn"),
                         purpose=txn.get("scope"), delegation_path=" > ".join(actor_chain(claims))) as sp:
             try:
-                result = handler(msg.get("params") or {}, claims, sp)
+                result = handler(camel_keys(msg.get("params") or {}), claims, sp)
             except RpcError as e:
                 sp.set(error_code=e.code)
                 return Response(200, rpc_response(rid, error=e))
@@ -206,6 +236,12 @@ class A2AAgent:
         message = params.get("message")
         if not isinstance(message, dict) or not message.get("parts"):
             raise RpcError(INVALID_PARAMS, "message with parts is required")
+        accepted = set(self.card_template.get("defaultInputModes", []))
+        for part in message["parts"]:
+            media_type = part.get("mediaType") if isinstance(part, dict) else None
+            if media_type and accepted and media_type not in accepted:
+                raise RpcError(CONTENT_TYPE_NOT_SUPPORTED, f"{media_type} is not accepted",
+                               {"accepted": sorted(accepted)})
         config = params.get("configuration") or {}
         if message.get("taskId"):
             rec = self._owned(message["taskId"], claims)
@@ -217,6 +253,9 @@ class A2AAgent:
                 rec.cond.notify_all()
             rec.wait(lambda: rec.state != INPUT_REQUIRED, 2.0)
         else:
+            reply = self.direct_reply(message) if self.direct_reply else None
+            if reply is not None:
+                return {"message": reply}
             rec = TaskRecord(message, claims["sub"], sp.traceparent)
             with self._lock:
                 self.tasks[rec.id] = rec
@@ -261,6 +300,8 @@ class A2AAgent:
                 rec.set_state(COMPLETED, result)
             except TaskCanceled:
                 pass
+            except TaskRejected as e:
+                rec.set_state(REJECTED, str(e))
             except Exception as e:  # agent failure becomes a FAILED task, not a crashed server
                 rec.set_state(FAILED, f"處理失敗：{e}")
                 sp.set(failure=str(e))
