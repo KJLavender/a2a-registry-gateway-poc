@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any
+from typing import Any, Callable
 
 from poc import llm
 from poc.agents.base import A2AAgent, TaskContext
@@ -186,5 +186,6 @@ AGENTS = {
 }
 
 
-def build_agents(verify: Verifier, speed: float) -> list[A2AAgent]:
-    return [A2AAgent(agent_id, card, handler, verify, speed) for agent_id, (card, handler) in AGENTS.items()]
+def build_agents(verify: Verifier, speed: float, verify_txn: Callable[[str], dict[str, Any]] | None = None
+                 ) -> list[A2AAgent]:
+    return [A2AAgent(agent_id, card, handler, verify, speed, verify_txn) for agent_id, (card, handler) in AGENTS.items()]

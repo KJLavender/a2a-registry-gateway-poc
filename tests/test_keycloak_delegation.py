@@ -10,7 +10,7 @@ Findings encoded here:
     carries `act` or `may_act` cannot be exchanged again, by standard exchange or by delegation, so
     `act` names one actor and cannot grow into a chain (gateway > registry > gateway > agent).
   - A user token with `may_act` is refused by standard exchange, so delegation and the PoC's
-    origin-scope approach cannot be used on the same token.
+    per-hop standard exchange cannot be used on the same token.
 """
 from __future__ import annotations
 

@@ -55,3 +55,16 @@ def message_text(message: dict[str, Any] | None) -> str:
     if not message:
         return ""
     return "\n".join(p["text"] for p in message.get("parts", []) if "text" in p)
+
+
+def is_new_task(rpc: Any) -> bool:
+    """A2A SendMessage without a taskId starts a new task; with one it continues an existing task."""
+    if not isinstance(rpc, dict) or rpc.get("method") != "SendMessage":
+        return False
+    params = rpc.get("params")
+    message = params.get("message") if isinstance(params, dict) else None
+    return not (isinstance(message, dict) and message.get("taskId"))
+
+
+def is_continuation(rpc: Any) -> bool:
+    return isinstance(rpc, dict) and rpc.get("method") == "SendMessage" and not is_new_task(rpc)

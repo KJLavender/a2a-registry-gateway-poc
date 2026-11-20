@@ -18,6 +18,7 @@ class McpContext:
     principal: Principal
     token: str  # kept only to exchange it; never logged or returned
     traceparent: str | None
+    txn_token: str = ""  # Txn-Token of this request (poc/txn.py); forwarded, never logged
 
 
 def tool_result(payload: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
@@ -102,7 +103,7 @@ def serve_mcp(server: McpServer, req: Request, authenticate: Callable[[Request],
     if not isinstance(msg, dict):
         return Response(400, rpc_response(None, error=RpcError(-32600, "batch requests are not supported")))
     traceparent = ((msg.get("params") or {}).get("_meta") or {}).get("traceparent") or req.headers.get("traceparent")
-    reply = server.handle(msg, McpContext(principal, req.bearer or "", traceparent))
+    reply = server.handle(msg, McpContext(principal, req.bearer or "", traceparent, req.headers.get("txn-token", "")))
     if reply is None:
         return Response(202)
     headers = {"Mcp-Session-Id": uuid.uuid4().hex} if msg.get("method") == "initialize" else {}

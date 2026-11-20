@@ -122,8 +122,8 @@ def verify_rs256(jwk: dict[str, Any], data: bytes, signature: bytes) -> bool:
 
 # --- JWT ------------------------------------------------------------------------------
 
-def encode(claims: dict[str, Any], key: RsaKey) -> str:
-    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": key.kid}, separators=(",", ":")).encode())
+def encode(claims: dict[str, Any], key: RsaKey, typ: str = "JWT") -> str:
+    header = b64url(json.dumps({"alg": "RS256", "typ": typ, "kid": key.kid}, separators=(",", ":")).encode())
     payload = b64url(json.dumps(claims, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
     signing_input = f"{header}.{payload}"
     return f"{signing_input}.{b64url(key.sign(signing_input.encode()))}"
@@ -134,7 +134,7 @@ def unverified_claims(token: str) -> dict[str, Any]:
 
 
 def decode(token: str, find_key: Callable[[str], dict[str, Any] | None], *,
-           audience: str | Iterable[str], issuer: str) -> dict[str, Any]:
+           audience: str | Iterable[str], issuer: str, typ: str | None = None) -> dict[str, Any]:
     try:
         header_b64, payload_b64, signature_b64 = token.split(".")
         header = json.loads(unb64url(header_b64))
@@ -144,6 +144,8 @@ def decode(token: str, find_key: Callable[[str], dict[str, Any] | None], *,
         raise TokenError("malformed token") from e
     if header.get("alg") != "RS256":
         raise TokenError("unsupported alg")
+    if typ is not None and header.get("typ") != typ:
+        raise TokenError(f"wrong token type (expected {typ})")
     jwk = find_key(header.get("kid", ""))
     if jwk is None:
         raise TokenError("unknown signing key")

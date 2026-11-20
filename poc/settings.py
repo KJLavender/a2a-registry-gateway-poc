@@ -29,6 +29,7 @@ class Settings:
     gateway_port: int = 18000
     registry_port: int = 18200
     pdp_port: int = 18400
+    txn_port: int = 18500
     agent_ports: dict[str, int] = field(default_factory=dict)
     # "builtin" = poc/gateway.py; "agentgateway" = the agentgateway binary configured from policy.json
     gateway_impl: str = field(default_factory=lambda: os.environ.get("POC_GATEWAY", "builtin"))
@@ -80,6 +81,10 @@ class Settings:
     @property
     def pdp_url(self) -> str:
         return self.url(self.pdp_port)
+
+    @property
+    def txn_url(self) -> str:
+        return self.url(self.txn_port)
 
     def agent_url(self, agent_id: str) -> str:
         return self.url(self.agent_ports[agent_id])

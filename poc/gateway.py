@@ -12,6 +12,10 @@ Policies enforced here
   3. A2A invoke   : delegation policy (caller agent -> target) + user authorization, checked on every new
                     task and again when a task is continued
   4. task access  : GetTask / CancelTask / resources/read only for the task owner
+
+Transaction tokens (poc/txn.py): the gateway is the edge of the trust domain. Each MCP request from a
+runtime gets a new Txn-Token, which the registry must send back on its A2A calls; the delegation
+policy reads the origin runtime from it, and its purpose limits which A2A calls the registry may make.
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ from typing import Any
 
 from poc.approvals import ApprovalStore
 from poc.common import trace
-from poc.common.a2a import TASK_NOT_FOUND
+from poc.common.a2a import POLICY_DENIED, TASK_NOT_FOUND
 from poc.common.identity import Principal, TokenExchanger, Verifier
 from poc.common.jwt import TokenError
 from poc.common.mcp import RESOURCE_NOT_FOUND, McpContext, McpServer, serve_mcp, tool_result
@@ -30,6 +34,7 @@ from poc.pdp import A2AAuthorizer, is_continuation, is_new_task, refusal
 from poc.policy import PolicyStore
 from poc.registry import parse_task_uri
 from poc.settings import Settings
+from poc.txn import EDGE_A2A, HEADER as TXN_HEADER, TxnGate, mcp_purpose, purpose_allows
 
 COMPONENT = "agent-gateway"
 _AGENT_ROUTE = re.compile(r"^/agents/([a-z0-9-]+)/(a2a|\.well-known/agent-card\.json)$")
@@ -101,6 +106,7 @@ class AgentGateway:
         self.authorizer = A2AAuthorizer(policy, approvals)
         self.verify = verify
         self.exchanger = exchanger
+        self.txn = TxnGate(settings)
         self.mcp = GatewayMcp(self)
         self._task_owner: dict[str, tuple[str, str]] = {}  # task_id -> (agent_id, user)
         self._lock = threading.Lock()
@@ -110,6 +116,7 @@ class AgentGateway:
 
     def __call__(self, req: Request) -> Response:
         if req.path == "/mcp":
+            req.headers.pop(TXN_HEADER, None)  # runtimes are outside the trust domain: the gateway mints
             return serve_mcp(self.mcp, req, self._authenticate)
         m = _AGENT_ROUTE.match(req.path)
         if m and m.group(1) in self.settings.agent_ports:
@@ -129,13 +136,22 @@ class AgentGateway:
         except TokenError as e:
             return Response(401, {"error": f"unauthorized: {e}"}, {"WWW-Authenticate": "Bearer"})
 
+    def _transaction(self, req: Request, p: Principal) -> tuple[Principal, str] | Response:
+        try:
+            return self.txn.establish(p, req.bearer or "", req.headers.get(TXN_HEADER, ""), EDGE_A2A)
+        except (TokenError, OSError) as e:
+            return Response(401, {"error": f"unauthorized: {e}"})
+
     # --- MCP upstream (registry) ---------------------------------------------------
 
     def forward_mcp(self, method: str, params: dict[str, Any], ctx: McpContext, sp: trace.Span) -> Any:
-        token = self.exchanger.exchange(ctx.token, "agent-registry", ctx.principal.origin_scope)
+        token = self.exchanger.exchange(ctx.token, "agent-registry")
+        if not ctx.txn_token:  # one transaction per MCP request from the runtime
+            ctx.txn_token = self.txn.mint(ctx.token, mcp_purpose(method, params))
         params = dict(params, _meta={"traceparent": sp.traceparent})  # MCP SEP-414
         return rpc_call(f"{self.settings.registry_url}/mcp", method, params,
-                        headers={"Authorization": f"Bearer {token}", "traceparent": sp.traceparent},
+                        headers={"Authorization": f"Bearer {token}", "traceparent": sp.traceparent,
+                                 "Txn-Token": ctx.txn_token},
                         timeout=self.settings.resource_wait_seconds + 15)
 
     def registry_tools(self, ctx: McpContext) -> list[dict[str, Any]]:
@@ -174,12 +190,21 @@ class AgentGateway:
         p = self._authenticate(req)
         if isinstance(p, Response):
             return p
+        established = self._transaction(req, p)
+        if isinstance(established, Response):
+            return established
+        p, txn_token = established
         with trace.span(f"gateway a2a {method}", COMPONENT, req.headers.get("traceparent"), agent_id=agent_id,
-                        user=p.username, delegation_path=" > ".join(p.actors)) as sp:
+                        user=p.username, delegation_path=" > ".join(p.actors), txn=p.txn,
+                        origin=p.origin_client, purpose=p.purpose) as sp:
             new_task = is_new_task(msg)
             if not self.policy.visible(p, agent_id):
                 sp.set(policy_effect="deny", reason="agent hidden from user")
                 return Response(404, {"error": "not found"})  # identical to a path with no agent
+            if not purpose_allows(p.purpose, msg):
+                sp.set(policy_effect="deny", reason="outside the transaction's purpose")
+                return Response(403, rpc_response(rid, error=RpcError(
+                    POLICY_DENIED, f"{method} is outside this transaction's purpose ({p.purpose})")))
             grant_id = None
             if new_task or is_continuation(msg):
                 decision = (self.authorizer.new_task if new_task else self.authorizer.continuation)(p, agent_id)
@@ -194,8 +219,9 @@ class AgentGateway:
                     sp.set(policy_effect="deny", reason="not task owner")
                     return Response(200, rpc_response(rid, error=RpcError(TASK_NOT_FOUND, "task not found")))
             try:
-                agent_token = self.exchanger.exchange(req.bearer or "", f"agent:{agent_id}", p.origin_scope)
-                headers = {"Authorization": f"Bearer {agent_token}", "traceparent": sp.traceparent}
+                agent_token = self.exchanger.exchange(req.bearer or "", f"agent:{agent_id}")
+                headers = {"Authorization": f"Bearer {agent_token}", "traceparent": sp.traceparent,
+                           "Txn-Token": txn_token}
                 if req.headers.get("a2a-version"):
                     headers["A2A-Version"] = req.headers["a2a-version"]
                 status, body, _ = http("POST", f"{self.settings.agent_url(agent_id)}/a2a", json_body=msg,
@@ -220,6 +246,10 @@ class AgentGateway:
             return p
         if p.immediate_actor != "agent-registry":
             return Response(403, {"error": "only the agent registry may call this endpoint"})
+        established = self._transaction(req, p)  # the origin runtime matters for delegation rules
+        if isinstance(established, Response):
+            return established
+        p, _ = established
         with trace.span("gateway access-check", COMPONENT, req.headers.get("traceparent"), user=p.username) as sp:
             out = {agent_id: self.policy.access_indication(p, agent_id, self.approvals.has_grant(p.sub, agent_id))
                    for agent_id in req.json().get("agent_ids", [])}

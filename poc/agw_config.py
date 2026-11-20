@@ -4,7 +4,9 @@ Mapping
   tools/list + tools/call  -> mcpAuthorization CEL rules (agentgateway filters tools/list by the same rules)
   A2A invocation           -> extAuthz to the policy decision point (poc/pdp.py), same logic as the
                               built-in gateway: approvals, 404 for hidden agents, reasons in the error
-  token exchange           -> backendAuth.oauthTokenExchange against the mock IdP (RFC 8693)
+  token exchange           -> backendAuth.oauthTokenExchange against the IdP (RFC 8693)
+  transaction tokens       -> extAuthz to the PDP on the MCP route mints the Txn-Token; agentgateway adds
+                              it to the request it sends to the registry (includeResponseHeaders)
 Task ownership is not checked here (the gateway cannot see A2A task owners); the registry and the
 agents check it.
 """
@@ -23,15 +25,12 @@ def _list(values: list[str]) -> str:
 
 
 def origin_client(depth: int = 4) -> str:
-    """CEL: the client the user signed in with.
-
-    Keycloak puts it in an `origin_client` claim; the mock IdP keeps an RFC 8693 `act` chain.
-    """
+    """CEL: the client the user signed in with (`azp` of a user token; the mock IdP may add an `act` chain)."""
     def walk(path: str, remaining: int) -> str:
         if remaining == 0:
             return f"{path}.sub"
         return f"(has({path}.act) ? {walk(path + '.act', remaining - 1)} : {path}.sub)"
-    return f"(has(jwt.origin_client) ? jwt.origin_client : (has(jwt.act) ? {walk('jwt.act', depth)} : jwt.azp))"
+    return f"(has(jwt.act) ? {walk('jwt.act', depth)} : jwt.azp)"
 
 
 def user_rule(rule: dict[str, Any]) -> str:
@@ -76,29 +75,29 @@ def build(settings: Settings) -> dict[str, Any]:
             "subjectToken": {"source": {"expression": "jwt.rawToken.unredacted()"}},
         }}}
 
-    pdp_check = {
-        "host": f"{settings.host}:{settings.pdp_port}",
-        "protocol": {"http": {
-            "path": '"/authz/a2a"',
-            "addRequestHeaders": {"x-subject-token": "jwt.rawToken.unredacted()", "x-original-path": "request.path"},
-        }},
-        "includeRequestBody": {"maxRequestBytes": 65536},
-        "failureMode": {"denyWithStatus": 503},
-    }
+    def pdp_check(path: str) -> dict[str, Any]:
+        return {
+            "host": f"{settings.host}:{settings.pdp_port}",
+            "protocol": {"http": {
+                "path": json.dumps(path),
+                "addRequestHeaders": {"x-subject-token": "jwt.rawToken.unredacted()",
+                                      "x-original-path": "request.path"},
+                # The PDP answers with the request's Txn-Token; agentgateway adds it to the upstream request
+                "includeResponseHeaders": ["txn-token"],
+            }},
+            "includeRequestHeaders": ["txn-token"],
+            "includeRequestBody": {"maxRequestBytes": 65536},
+            "failureMode": {"denyWithStatus": 503},
+        }
     routes: list[dict[str, Any]] = [
         {"name": "healthz", "matches": [{"path": {"exact": "/healthz"}}],
          "policies": {"directResponse": {"status": 200, "body": list(b'{"status": "ok"}')}}},
         {"name": "mcp", "matches": [{"path": {"exact": "/mcp"}}],
-         "policies": {"jwtAuth": jwt_auth, "mcpAuthorization": {"rules": mcp_rules(policy)}},
+         "policies": {"jwtAuth": jwt_auth, "mcpAuthorization": {"rules": mcp_rules(policy)},
+                      "extAuthz": pdp_check("/authz/mcp")},
          "backends": [{"mcp": {"statefulMode": "stateless", "prefixMode": "never",
                                "targets": [{"name": "registry", "mcp": {"host": f"{settings.registry_url}/mcp"}}]},
-                       "policies": {
-                           **exchange("agent-registry"),
-                           # Keycloak drops origin_client on exchange and agentgateway cannot request a
-                           # per-caller scope, so pass the runtime it validated as a header (overwrites
-                           # anything the client sent). The registry trusts it only on gateway tokens.
-                           "transformations": {"request": {"set": {"x-origin-client": origin_client()}}},
-                       }}]},
+                       "policies": exchange("agent-registry")}]},
     ]
     for agent_id, port in settings.agent_ports.items():
         routes.append({
@@ -107,7 +106,7 @@ def build(settings: Settings) -> dict[str, Any]:
             "policies": {"jwtAuth": jwt_auth,
                          # The PDP decides (approval flow, 404 for hidden agents, reasons in the error body).
                          # CEL alone can only allow or deny with a 403.
-                         "extAuthz": pdp_check,
+                         "extAuthz": pdp_check("/authz/a2a"),
                          "urlRewrite": {"path": {"prefix": "/"}},
                          "a2a": {}},
             "backends": [{"host": f"{settings.host}:{port}", "policies": exchange(f"agent:{agent_id}")}],

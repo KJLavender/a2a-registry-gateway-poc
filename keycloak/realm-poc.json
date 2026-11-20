@@ -147,72 +147,6 @@
           }
         }
       ]
-    },
-    {
-      "name": "origin-orchestrator-runtime",
-      "protocol": "openid-connect",
-      "attributes": {
-        "include.in.token.scope": "false"
-      },
-      "protocolMappers": [
-        {
-          "name": "origin",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-hardcoded-claim-mapper",
-          "config": {
-            "access.token.claim": "true",
-            "id.token.claim": "false",
-            "introspection.token.claim": "true",
-            "claim.name": "origin_client",
-            "claim.value": "orchestrator-runtime",
-            "jsonType.label": "String"
-          }
-        }
-      ]
-    },
-    {
-      "name": "origin-plain-runtime",
-      "protocol": "openid-connect",
-      "attributes": {
-        "include.in.token.scope": "false"
-      },
-      "protocolMappers": [
-        {
-          "name": "origin",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-hardcoded-claim-mapper",
-          "config": {
-            "access.token.claim": "true",
-            "id.token.claim": "false",
-            "introspection.token.claim": "true",
-            "claim.name": "origin_client",
-            "claim.value": "plain-runtime",
-            "jsonType.label": "String"
-          }
-        }
-      ]
-    },
-    {
-      "name": "origin-report-runtime",
-      "protocol": "openid-connect",
-      "attributes": {
-        "include.in.token.scope": "false"
-      },
-      "protocolMappers": [
-        {
-          "name": "origin",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-hardcoded-claim-mapper",
-          "config": {
-            "access.token.claim": "true",
-            "id.token.claim": "false",
-            "introspection.token.claim": "true",
-            "claim.name": "origin_client",
-            "claim.value": "report-runtime",
-            "jsonType.label": "String"
-          }
-        }
-      ]
     }
   ],
   "defaultDefaultClientScopes": [],
@@ -332,8 +266,7 @@
       "directAccessGrantsEnabled": true,
       "fullScopeAllowed": true,
       "defaultClientScopes": [
-        "poc-claims",
-        "origin-orchestrator-runtime"
+        "poc-claims"
       ],
       "optionalClientScopes": [],
       "protocolMappers": [
@@ -358,8 +291,7 @@
       "directAccessGrantsEnabled": true,
       "fullScopeAllowed": true,
       "defaultClientScopes": [
-        "poc-claims",
-        "origin-plain-runtime"
+        "poc-claims"
       ],
       "optionalClientScopes": [],
       "protocolMappers": [
@@ -384,8 +316,7 @@
       "directAccessGrantsEnabled": true,
       "fullScopeAllowed": true,
       "defaultClientScopes": [
-        "poc-claims",
-        "origin-report-runtime"
+        "poc-claims"
       ],
       "optionalClientScopes": [],
       "protocolMappers": [
@@ -417,11 +348,7 @@
       "defaultClientScopes": [
         "poc-claims"
       ],
-      "optionalClientScopes": [
-        "origin-orchestrator-runtime",
-        "origin-plain-runtime",
-        "origin-report-runtime"
-      ],
+      "optionalClientScopes": [],
       "protocolMappers": [
         {
           "name": "aud-agent-registry",
@@ -492,8 +419,7 @@
       ],
       "fullScopeAllowed": true,
       "defaultClientScopes": [
-        "poc-claims",
-        "origin-orchestrator-runtime"
+        "poc-claims"
       ],
       "optionalClientScopes": [
         "delegation:client"
@@ -527,11 +453,7 @@
       "defaultClientScopes": [
         "poc-claims"
       ],
-      "optionalClientScopes": [
-        "origin-orchestrator-runtime",
-        "origin-plain-runtime",
-        "origin-report-runtime"
-      ],
+      "optionalClientScopes": [],
       "protocolMappers": [
         {
           "name": "aud-agent-gateway",

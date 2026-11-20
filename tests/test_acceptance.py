@@ -18,12 +18,13 @@ from unittest import mock
 from poc import runtime, traceview
 from poc.agents.base import A2AAgent
 from poc.common.a2a import ROLE_USER, text_message
-from poc.common.identity import JwksCache, login
+from poc.common.identity import ACCESS_TOKEN_TYPE, TOKEN_EXCHANGE, JwksCache, login
 from poc.common.web import Response, RpcError, free_port, http
 from poc.launcher import Stack, start_stack
 from poc.registry import Catalog, validate_card
 from poc.runtime import McpClient
 from poc.settings import ROOT, Settings
+from poc.txn import TxnGate
 
 STACK: Stack
 SETTINGS: Settings
@@ -38,7 +39,8 @@ def setUpModule() -> None:
     agents = json.loads((_TMP / "config" / "agents.json").read_text(encoding="utf-8"))["agents"]
     SETTINGS = Settings(config_dir=_TMP / "config", var_dir=_TMP / "var",
                         idp_port=free_port() if Settings(agent_ports={"_": 0}).idp_impl == "mock" else 0,
-                        gateway_port=free_port(), registry_port=free_port(),
+                        gateway_port=free_port(), registry_port=free_port(), pdp_port=free_port(),
+                        txn_port=free_port(),
                         agent_ports={a["agent_id"]: free_port() for a in agents},
                         speed=0.5, resource_wait_seconds=4)
     STACK = start_stack(SETTINGS)
@@ -53,6 +55,29 @@ def mcp_for(user: str, client: str = "orchestrator-runtime") -> McpClient:
     mcp = McpClient(f"{SETTINGS.gateway_url}/mcp", login(SETTINGS, user, client))
     mcp.initialize()
     return mcp
+
+
+def exchange(token: str, client: str, audience: str) -> str:
+    status, body, _ = http("POST", SETTINGS.token_endpoint, form={
+        "grant_type": TOKEN_EXCHANGE, "client_id": client, "client_secret": SETTINGS.client_secret(client),
+        "subject_token": token, "subject_token_type": ACCESS_TOKEN_TYPE, "audience": audience})
+    assert status == 200, body
+    return body["access_token"]
+
+
+def registry_side(user: str, runtime: str = "orchestrator-runtime") -> tuple[str, str]:
+    """(user token, the token the registry holds when it calls back into the gateway)"""
+    user_token = login(SETTINGS, user, runtime)
+    return user_token, exchange(exchange(user_token, "agent-gateway", "agent-registry"), "agent-registry",
+                                "agent-gateway")
+
+
+def a2a_post(path: str, token: str, rpc: dict, txn: str | None = None) -> tuple[int, object]:
+    headers = {"Authorization": f"Bearer {token}", "A2A-Version": "1.0"}
+    if txn:
+        headers["Txn-Token"] = txn
+    status, body, _ = http("POST", f"{SETTINGS.gateway_url}{path}", json_body=rpc, headers=headers)
+    return status, body
 
 
 def read_until_done(mcp: McpClient, uri: str, limit: float = 20) -> dict:
@@ -253,12 +278,61 @@ class Authorization(unittest.TestCase):
             policy_path.write_text(original, encoding="utf-8")
             time.sleep(1.5 if AGW else 0.05)
 
-    def test_origin_header_cannot_be_spoofed(self):
+    def test_runtime_cannot_bring_its_own_transaction_token(self):
+        # A genuine Txn-Token that says "orchestrator-runtime", sent along by a report-runtime session
+        orchestrator_txn = TxnGate(SETTINGS).mint(login(SETTINGS, "carol", "orchestrator-runtime"), "invoke_agent")
         carol = mcp_for("carol", "report-runtime")
-        carol.extra_headers["x-origin-client"] = "orchestrator-runtime"  # pretend to be the orchestrator
+        carol.extra_headers["Txn-Token"] = orchestrator_txn
         result, is_error = carol.call_tool("invoke_agent", {"agent_id": "expense-approver", "message": "12000 元 差旅"})
         self.assertTrue(is_error)
-        self.assertEqual(result["effect"], "deny")
+        self.assertEqual(result["effect"], "deny")  # the gateway minted its own: origin is report-runtime
+
+
+class TransactionTokens(unittest.TestCase):
+    """Txn-Tokens (poc/txn.py) carry the user, origin runtime and purpose across the internal hops."""
+
+    RPC = {"jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+           "params": {"message": text_message(ROLE_USER, "VPN 連不上"), "configuration": {"returnImmediately": True}}}
+
+    def test_registry_requires_a_transaction_token(self):
+        token = exchange(login(SETTINGS, "alice", "orchestrator-runtime"), "agent-gateway", "agent-registry")
+        status, _, _ = http("POST", f"{SETTINGS.registry_url}/mcp", headers={"Authorization": f"Bearer {token}"},
+                            json_body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.assertEqual(status, 401)
+
+    def test_internal_caller_needs_the_transaction_token(self):
+        _, internal = registry_side("alice")
+        status, _ = a2a_post("/agents/it-helpdesk/a2a", internal, self.RPC)
+        self.assertEqual(status, 401)
+
+    def test_purpose_limits_what_the_registry_may_do(self):
+        user_token, internal = registry_side("alice")
+        gate = TxnGate(SETTINGS)
+        status, body = a2a_post("/agents/it-helpdesk/a2a", internal, self.RPC, gate.mint(user_token, "search_agents"))
+        self.assertEqual(status, 403)
+        self.assertIn("purpose", body["error"]["message"])
+        status, body = a2a_post("/agents/it-helpdesk/a2a", internal, self.RPC, gate.mint(user_token, "invoke_agent"))
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["result"]["task"]["id"])
+
+    def test_transaction_token_must_match_the_user(self):
+        _, internal = registry_side("alice")
+        bob_txn = TxnGate(SETTINGS).mint(login(SETTINGS, "bob", "orchestrator-runtime"), "invoke_agent")
+        status, _ = a2a_post("/agents/it-helpdesk/a2a", internal, self.RPC, bob_txn)
+        self.assertEqual(status, 401)
+
+    def test_only_the_edge_mints_and_only_for_outside_tokens(self):
+        user_token, internal = registry_side("alice")
+        form = {"grant_type": TOKEN_EXCHANGE, "requested_token_type": "urn:ietf:params:oauth:token-type:txn_token",
+                "audience": "poc.internal", "subject_token_type": ACCESS_TOKEN_TYPE, "scope": "invoke_agent"}
+        status, body, _ = http("POST", f"{SETTINGS.txn_url}/token", form={
+            **form, "client_id": "agent-registry", "client_secret": SETTINGS.client_secret("agent-registry"),
+            "subject_token": user_token})
+        self.assertEqual((status, body["error"]), (401, "invalid_client"))
+        status, body, _ = http("POST", f"{SETTINGS.txn_url}/token", form={
+            **form, "client_id": "agent-gateway", "client_secret": SETTINGS.client_secret("agent-gateway"),
+            "subject_token": internal})
+        self.assertEqual((status, body["error"]), (400, "invalid_grant"))
 
     def test_approval_flow(self):
         dave = mcp_for("dave")
@@ -331,6 +405,13 @@ class Observability(unittest.TestCase):
             self.assertNotIn("eyJ", gateway_log)
         else:
             self.assertEqual(orphans, [])
+        # One transaction id from the registry to the agent, and the agent knows the origin runtime
+        invoke = next(s for s in spans if s["name"] == "registry invoke_agent")
+        send = next(s for s in spans if s["name"] == "a2a SendMessage")
+        self.assertTrue(invoke["attributes"]["txn"])
+        self.assertEqual(send["attributes"]["txn"], invoke["attributes"]["txn"])
+        self.assertEqual(send["attributes"]["origin"], "orchestrator-runtime")
+        self.assertEqual(send["attributes"]["purpose"], "invoke_agent")
         raw = SETTINGS.trace_file.read_text(encoding="utf-8")
         self.assertNotIn("eyJ", raw)  # JWTs start with eyJ
         self.assertNotIn("Bearer", raw)

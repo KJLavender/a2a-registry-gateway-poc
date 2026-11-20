@@ -24,6 +24,7 @@ from poc.pdp import PolicyDecisionPoint
 from poc.policy import PolicyStore
 from poc.registry import AgentRegistry
 from poc.settings import Settings
+from poc.txn import TxnTokenService, TxnVerifier
 
 log = logging.getLogger("poc.launcher")
 
@@ -132,8 +133,9 @@ def _start(settings: Settings, servers: list[ThreadingHTTPServer]) -> Stack:
     else:
         servers.append(serve(make_app(IdentityProvider(settings)), settings.host, settings.idp_port))
     verify = make_verifier(settings)
+    servers.append(serve(TxnTokenService(settings, verify), settings.host, settings.txn_port))
 
-    agents = build_agents(verify, settings.speed)
+    agents = build_agents(verify, settings.speed, TxnVerifier(settings).verify)
     for agent in agents:
         agent.base_url = settings.agent_url(agent.agent_id)
         servers.append(serve(agent, settings.host, settings.agent_ports[agent.agent_id]))
@@ -144,7 +146,7 @@ def _start(settings: Settings, servers: list[ThreadingHTTPServer]) -> Stack:
 
     policy = PolicyStore(settings.config_dir / "policy.json")
     approvals = ApprovalStore(settings.var_dir / "approvals.db")
-    servers.append(serve(PolicyDecisionPoint(policy, approvals, verify), settings.host, settings.pdp_port))
+    servers.append(serve(PolicyDecisionPoint(settings, policy, approvals, verify), settings.host, settings.pdp_port))
 
     if settings.gateway_impl == "agentgateway":
         stack = Stack(settings, servers, agents, registry, None, _start_agentgateway(settings))

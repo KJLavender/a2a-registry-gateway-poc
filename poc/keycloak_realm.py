@@ -1,9 +1,9 @@
 """Generate a Keycloak realm import (keycloak/realm-poc.json) from config/users.json and policy.json.
 
 Keycloak's standard token exchange (GA since 26.2) does not add an `act` claim, and the exchanged
-token's `azp` becomes the service that asked for it. To keep "which runtime started this" across
-hops, each runtime gets an `origin-<runtime>` client scope with a hardcoded `origin_client` claim.
-Services that exchange tokens request `scope=origin-<runtime>` so the claim survives every hop.
+token's `azp` becomes the service that asked for it, so after the first hop the access token no longer
+shows which runtime started the request. That context travels in the Txn-Token instead (poc/txn.py);
+Keycloak only issues the per-hop access tokens.
 """
 from __future__ import annotations
 
@@ -61,14 +61,14 @@ DELEGATION_CLIENT_SCOPE = {
 }
 
 
-def _service_client(client_id: str, secret: str, audiences: list[str], origin_scopes: list[str],
+def _service_client(client_id: str, secret: str, audiences: list[str],
                     service_account: bool = False) -> dict[str, Any]:
     return {
         "clientId": client_id, "enabled": True, "publicClient": False, "secret": secret,
         "standardFlowEnabled": False, "directAccessGrantsEnabled": False, "serviceAccountsEnabled": service_account,
         "attributes": {"standard.token.exchange.enabled": "true"},
         "fullScopeAllowed": True,
-        "defaultClientScopes": ["poc-claims"], "optionalClientScopes": origin_scopes,
+        "defaultClientScopes": ["poc-claims"], "optionalClientScopes": [],
         "protocolMappers": [_audience(a) for a in audiences],
     }
 
@@ -77,7 +77,6 @@ def build(settings: Settings) -> dict[str, Any]:
     directory = settings.load("users.json")
     policy = settings.load("policy.json")
     runtimes = sorted(policy["runtimes"])
-    origin_scopes = [f"origin-{r}" for r in runtimes]
     groups = sorted({g for u in directory["users"].values() for g in u["groups"]})
     roles = sorted({r for u in directory["users"].values() for r in u["roles"]})
     agent_clients = [f"agent:{a}" for a in settings.agent_ports]
@@ -95,13 +94,6 @@ def build(settings: Settings) -> dict[str, Any]:
     client_scopes = [{"name": "poc-claims", "protocol": "openid-connect",
                       "attributes": {"include.in.token.scope": "false"}, "protocolMappers": CLAIM_MAPPERS},
                      DELEGATION_CLIENT_SCOPE]
-    for runtime in runtimes:
-        client_scopes.append({
-            "name": f"origin-{runtime}", "protocol": "openid-connect",
-            "attributes": {"include.in.token.scope": "false"},
-            "protocolMappers": [_mapper("origin", "oidc-hardcoded-claim-mapper", **{
-                "claim.name": "origin_client", "claim.value": runtime, "jsonType.label": "String"})],
-        })
 
     clients = []
     for runtime in runtimes:  # what a user signs in with (password grant stands in for SSO)
@@ -109,22 +101,22 @@ def build(settings: Settings) -> dict[str, Any]:
             "clientId": runtime, "enabled": True, "publicClient": True,
             "standardFlowEnabled": False, "directAccessGrantsEnabled": True,
             "fullScopeAllowed": True,
-            "defaultClientScopes": ["poc-claims", f"origin-{runtime}"], "optionalClientScopes": [],
+            "defaultClientScopes": ["poc-claims"], "optionalClientScopes": [],
             "protocolMappers": [_audience("agent-gateway")],
         })
     secrets = {c: v["secret"] for c, v in directory["clients"].items() if v.get("type") == "service"}
     # agent-gateway gets a service account: it is the actor in delegated exchanges
     clients.append(_service_client("agent-gateway", secrets["agent-gateway"], ["agent-registry", *agent_clients],
-                                   origin_scopes, service_account=True))
+                                   service_account=True))
     clients.append({  # delegation needs a consent screen, so this one uses the browser login flow
         "clientId": DELEGATING_CLIENT, "enabled": True, "publicClient": True, "consentRequired": True,
         "standardFlowEnabled": True, "directAccessGrantsEnabled": False,
         "redirectUris": [DELEGATION_REDIRECT], "fullScopeAllowed": True,
-        "defaultClientScopes": ["poc-claims", "origin-orchestrator-runtime"],
+        "defaultClientScopes": ["poc-claims"],
         "optionalClientScopes": ["delegation:client"],
         "protocolMappers": [_audience("agent-gateway")],
     })
-    clients.append(_service_client("agent-registry", secrets["agent-registry"], ["agent-gateway"], origin_scopes,
+    clients.append(_service_client("agent-registry", secrets["agent-registry"], ["agent-gateway"],
                                    service_account=True))  # only used to show a wrong actor is refused
     for client_id in agent_clients:  # audiences only; they never request tokens
         clients.append({"clientId": client_id, "enabled": True, "publicClient": False,

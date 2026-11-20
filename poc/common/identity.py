@@ -77,16 +77,15 @@ class Principal:
     groups: tuple[str, ...]
     roles: tuple[str, ...]
     actors: tuple[str, ...]  # most recent actor first; last item is the client the user signed in with
+    # Set from the Txn-Token (poc/txn.py) behind the edge, where access tokens no longer show the runtime
     origin_claim: str = ""
+    txn: str = ""
+    purpose: str = ""
 
     @property
     def origin_client(self) -> str:
-        """The runtime the user signed in with. Keycloak carries it as `origin_client` (no `act` chain)."""
+        """The runtime the user signed in with: from the Txn-Token, else from the user's own token."""
         return self.origin_claim or (self.actors[-1] if self.actors else "")
-
-    @property
-    def origin_scope(self) -> str:
-        return f"origin-{self.origin_client}"
 
     @property
     def immediate_actor(self) -> str:
@@ -96,7 +95,7 @@ class Principal:
     def from_claims(cls, claims: dict[str, Any]) -> "Principal":
         username = claims.get("preferred_username", claims["sub"])
         return cls(claims["sub"], username, claims.get("name", username), tuple(claims.get("groups", [])),
-                   tuple(claims.get("roles", [])), tuple(actor_chain(claims)), claims.get("origin_client", ""))
+                   tuple(claims.get("roles", [])), tuple(actor_chain(claims)))
 
 
 class TokenExchanger:

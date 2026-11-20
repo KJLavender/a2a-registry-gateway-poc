@@ -135,11 +135,13 @@ Handler = Callable[[TaskContext], str]
 
 
 class A2AAgent:
-    def __init__(self, agent_id: str, card: dict[str, Any], handler: Handler, verify: Verifier, speed: float = 1.0):
+    def __init__(self, agent_id: str, card: dict[str, Any], handler: Handler, verify: Verifier, speed: float = 1.0,
+                 verify_txn: Callable[[str], dict[str, Any]] | None = None):
         self.agent_id = agent_id
         self.card_template = card
         self.handler = handler
         self.verify = verify
+        self.verify_txn = verify_txn  # Txn-Token check (poc/txn.py); None only for stand-alone runs
         self.speed = speed
         self.base_url = ""
         self.tasks: dict[str, TaskRecord] = {}
@@ -167,6 +169,9 @@ class A2AAgent:
         rid = msg.get("id")
         try:
             claims = self.verify(req.bearer or "", f"agent:{self.agent_id}")
+            txn = self.verify_txn(req.headers.get("txn-token", "")) if self.verify_txn else {}
+            if self.verify_txn and txn.get("sub") != claims["sub"]:
+                raise TokenError("transaction token belongs to another user")
         except TokenError as e:
             return Response(401, rpc_response(rid, error=RpcError(-32000, f"unauthorized: {e}")),
                             {"WWW-Authenticate": "Bearer"})
@@ -180,8 +185,9 @@ class A2AAgent:
         if handler is None:
             return Response(200, rpc_response(rid, error=RpcError(METHOD_NOT_FOUND, f"method {method} not found")))
         with trace.span(f"a2a {method}", self.component, req.headers.get("traceparent"),
-                        user=claims.get("preferred_username", claims["sub"]), origin=claims.get("origin_client"),
-                        delegation_path=" > ".join(actor_chain(claims))) as sp:
+                        user=claims.get("preferred_username", claims["sub"]),
+                        origin=txn.get("tctx", {}).get("origin_client"), txn=txn.get("txn"),
+                        purpose=txn.get("scope"), delegation_path=" > ".join(actor_chain(claims))) as sp:
             try:
                 result = handler(msg.get("params") or {}, claims, sp)
             except RpcError as e:

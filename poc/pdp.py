@@ -3,6 +3,8 @@
 Routes
   ANY  /authz/a2a                       agentgateway extAuthz (HTTP). 200 = allow; otherwise the status and
                                         JSON-RPC error body are what the caller sees.
+  ANY  /authz/mcp                       agentgateway extAuthz on the MCP route: mints the request's Txn-Token
+                                        (poc/txn.py), which agentgateway passes on to the registry.
   GET  /approvals                       pending requests the caller may decide, plus the caller's own
   POST /approvals/{id}/approve|reject   decide a request (approver rule from policy.json; not your own)
 
@@ -16,11 +18,13 @@ from typing import Any
 
 from poc.approvals import ApprovalError, ApprovalStore
 from poc.common import trace
-from poc.common.a2a import POLICY_DENIED
+from poc.common.a2a import POLICY_DENIED, is_continuation, is_new_task
 from poc.common.identity import Principal, Verifier
 from poc.common.jwt import TokenError
 from poc.common.web import Request, Response, RpcError, rpc_response
 from poc.policy import ALLOW, APPROVAL, Decision, PolicyStore
+from poc.settings import Settings
+from poc.txn import EDGE_A2A, HEADER as TXN_HEADER, TxnGate, mcp_purpose, purpose_allows
 
 COMPONENT = "policy-decision-point"
 _AGENT_PATH = re.compile(r"^/agents/([a-z0-9-]+)/")
@@ -28,19 +32,6 @@ _DECIDE_PATH = re.compile(r"^/approvals/(APR-[0-9A-F]+)/(approve|reject)$")
 # Same status and body agentgateway returns for a path no route matches, so a hidden agent
 # cannot be told apart from one that does not exist.
 NOT_FOUND = Response(404, "route not found", {"Content-Type": "text/plain"})
-
-
-def is_new_task(rpc: Any) -> bool:
-    """A2A SendMessage without a taskId starts a new task; with one it continues an existing task."""
-    if not isinstance(rpc, dict) or rpc.get("method") != "SendMessage":
-        return False
-    params = rpc.get("params")
-    message = params.get("message") if isinstance(params, dict) else None
-    return not (isinstance(message, dict) and message.get("taskId"))
-
-
-def is_continuation(rpc: Any) -> bool:
-    return isinstance(rpc, dict) and rpc.get("method") == "SendMessage" and not is_new_task(rpc)
 
 
 class A2AAuthorizer:
@@ -80,15 +71,18 @@ def refusal(rid: Any, decision: Decision) -> Response:
 
 
 class PolicyDecisionPoint:
-    def __init__(self, policy: PolicyStore, approvals: ApprovalStore, verify: Verifier):
+    def __init__(self, settings: Settings, policy: PolicyStore, approvals: ApprovalStore, verify: Verifier):
         self.policy = policy
         self.approvals = approvals
         self.verify = verify
+        self.txn = TxnGate(settings)  # the PDP is agentgateway's half of the trust-domain edge
         self.authorizer = A2AAuthorizer(policy, approvals)
 
     def __call__(self, req: Request) -> Response:
         if req.path == "/authz/a2a":  # agentgateway keeps the original method (GET for agent cards)
             return self._authz(req)
+        if req.path == "/authz/mcp":
+            return self._authz_mcp(req)
         if req.method == "POST" and req.path == "/approvals/restore":
             return self._restore(req)
         if req.method == "GET" and req.path == "/approvals":
@@ -108,7 +102,8 @@ class PolicyDecisionPoint:
 
     def _authz(self, req: Request) -> Response:
         # agentgateway sends the validated token and original path as headers, the A2A body as the body
-        p = self._principal(req.headers.get("x-subject-token", ""))
+        subject_token = req.headers.get("x-subject-token", "")
+        p = self._principal(subject_token)
         if isinstance(p, Response):
             return p
         m = _AGENT_PATH.match(req.headers.get("x-original-path", ""))
@@ -116,26 +111,54 @@ class PolicyDecisionPoint:
             return NOT_FOUND
         agent_id = m.group(1)
         try:
+            p, txn_token = self.txn.establish(p, subject_token, req.headers.get(TXN_HEADER, ""), EDGE_A2A)
+        except (TokenError, OSError) as e:
+            return Response(401, {"error": f"unauthorized: {e}"})
+        allow = Response(200, {"allow": True}, {"Txn-Token": txn_token})  # agentgateway passes it to the agent
+        try:
             rpc = json.loads(req.body or b"{}")
         except ValueError:
             rpc = {}
         method = rpc.get("method") if isinstance(rpc, dict) else None
         with trace.span(f"pdp authz {method}", COMPONENT, req.headers.get("traceparent"),
-                        agent_id=agent_id, user=p.username) as sp:
+                        agent_id=agent_id, user=p.username, txn=p.txn, origin=p.origin_client,
+                        purpose=p.purpose) as sp:
             if not self.policy.visible(p, agent_id):
                 sp.set(policy_effect="deny", reason="agent hidden from user")
                 return NOT_FOUND
+            if req.method == "GET":
+                return allow  # agent card
+            if not purpose_allows(p.purpose, rpc):
+                sp.set(policy_effect="deny", reason="outside the transaction's purpose")
+                return Response(403, rpc_response(rpc.get("id") if isinstance(rpc, dict) else None, error=RpcError(
+                    POLICY_DENIED, f"{method} is outside this transaction's purpose ({p.purpose})")))
             if is_new_task(rpc):
                 decision = self.authorizer.new_task(p, agent_id)
             elif is_continuation(rpc):
                 decision = self.authorizer.continuation(p, agent_id)
             else:
-                return Response(200, {"allow": True})  # GetTask/CancelTask: the agent serves the owner only
+                return allow  # GetTask/CancelTask: the agent serves the owner only
             sp.set(policy_effect=decision.effect, policy_rule=decision.rule, decision_id=decision.decision_id,
                    approval_request_id=decision.approval_request_id)
             if decision.allowed:
-                return Response(200, {"allow": True})
+                return allow
             return refusal(rpc.get("id"), decision)
+
+    def _authz_mcp(self, req: Request) -> Response:
+        """Edge of the trust domain for MCP: a new Txn-Token for every request from a runtime."""
+        subject_token = req.headers.get("x-subject-token", "")
+        try:
+            rpc = json.loads(req.body or b"{}")
+        except ValueError:
+            rpc = {}
+        purpose = mcp_purpose(rpc.get("method", ""), rpc.get("params")) if isinstance(rpc, dict) else ""
+        with trace.span("pdp mint txn-token", COMPONENT, req.headers.get("traceparent"), purpose=purpose) as sp:
+            try:
+                token = self.txn.mint(subject_token, purpose)
+            except (TokenError, OSError) as e:
+                sp.set(error=str(e))
+                return Response(401, {"error": f"unauthorized: {e}"})
+        return Response(200, {"allow": True}, {"Txn-Token": token})
 
     def _restore(self, req: Request) -> Response:
         """Called by the registry when a call allowed by an approval failed before reaching the agent."""
