@@ -30,6 +30,10 @@
       "visibility": "hidden",
       "visible_to_groups": ["secops"],
       "invoke": {"allow_groups": ["secops"]}
+    },
+    "hr-leave": {
+      "visibility": "listed",
+      "invoke": {"allow_groups": ["employees"]}
     }
   },
   "delegation": {

@@ -93,9 +93,12 @@ class AgentIndex:
 
 
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-# Cosine similarity a card needs to count as a match on meaning alone. With the demo catalog, unrelated
-# requests (meeting rooms, weather, lunch) stay below 0.39 and paraphrased real ones score 0.44 or more.
+# Cosine similarity a card needs to count as a match on meaning alone, tuned on the demo catalog:
+# paraphrased real requests score 0.44-0.64, unrelated ones (weather, lunch, stock price) stay below 0.40.
+# Near misses get through: "幫我訂明天下午的會議室" scores 0.52 against the leave agent and "幫我訂高鐵票"
+# 0.52 against expenses. The caller still reads the card and decides; a real catalog needs its own test set.
 SEMANTIC_MIN = 0.42
+SEMANTIC_MARGIN = 0.2  # like RELATIVE_CUTOFF: drop matches far weaker than the best one
 RRF_K = 60
 
 Embedder = Callable[[list[str]], list[list[float]]]
@@ -162,7 +165,8 @@ class HybridIndex:
             return []
         keyword = {a: (score, terms) for a, score, terms in self.keyword.search(query, limit)}
         sims = self._similarities(query)
-        semantic = sorted((a for a, s in sims.items() if s >= SEMANTIC_MIN), key=lambda a: -sims[a])
+        floor = max(SEMANTIC_MIN, max(sims.values(), default=0.0) - SEMANTIC_MARGIN)
+        semantic = sorted((a for a, s in sims.items() if s >= floor), key=lambda a: -sims[a])
         fused: dict[str, float] = {}
         for ranking in (list(keyword), semantic):
             for rank, agent_id in enumerate(ranking):

@@ -117,6 +117,19 @@ def _regenerate_on_policy_change(stack: Stack) -> None:
             log.warning("policy.json not applied to agentgateway yet: %s", e)
 
 
+def _start_sdk_agent(settings: Settings, verify, verify_txn, servers: list) -> None:
+    """hr-leave runs on the official A2A SDK (optional dependency, see poc/agents/sdk_agent.py)."""
+    if "hr-leave" not in settings.agent_ports:
+        return
+    try:
+        from poc.agents import sdk_agent
+    except ImportError as e:
+        log.info("hr-leave not started (needs a2a-sdk[http-server] and uvicorn): %s", e)
+        return
+    app = sdk_agent.build_app(settings.agent_url("hr-leave"), verify, verify_txn, settings.speed)
+    servers.append(sdk_agent.SdkAgentServer(app, settings.host, settings.agent_ports["hr-leave"]))
+
+
 def start_stack(settings: Settings) -> Stack:
     servers: list[ThreadingHTTPServer] = []
     try:
@@ -136,10 +149,12 @@ def _start(settings: Settings, servers: list[ThreadingHTTPServer]) -> Stack:
     verify = make_verifier(settings)
     servers.append(serve(TxnTokenService(settings, verify), settings.host, settings.txn_port))
 
-    agents = build_agents(verify, settings.speed, TxnVerifier(settings).verify)
+    verify_txn = TxnVerifier(settings).verify
+    agents = build_agents(verify, settings.speed, verify_txn)
     for agent in agents:
         agent.base_url = settings.agent_url(agent.agent_id)
         servers.append(serve(agent, settings.host, settings.agent_ports[agent.agent_id]))
+    _start_sdk_agent(settings, verify, verify_txn, servers)
 
     registry = AgentRegistry(settings, verify, TokenExchanger(settings, "agent-registry"))
     servers.append(serve(registry, settings.host, settings.registry_port))

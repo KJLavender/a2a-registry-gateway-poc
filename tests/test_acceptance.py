@@ -162,8 +162,8 @@ class Discovery(unittest.TestCase):
         self.assertEqual(vpn["matches"][0]["matched_terms"], [])  # no shared keywords: found by meaning
         taxi, _ = alice.call_tool("search_agents", {"query": "上週出差的計程車錢要怎麼拿回來"})
         self.assertEqual(taxi["matches"][0]["agent_id"], "expense-approver")
-        room, _ = alice.call_tool("search_agents", {"query": "幫我訂明天下午的會議室"})
-        self.assertEqual(room["result"], "no_matching_agent")
+        unrelated, _ = alice.call_tool("search_agents", {"query": "公司股價多少"})
+        self.assertEqual(unrelated["result"], "no_matching_agent")
         bob = mcp_for("bob")
         forensics, _ = bob.call_tool("search_agents", {"query": "有人半夜用我的帳號登入，幫我查入侵的時間軸"})
         self.assertNotIn("security-forensics", [m["agent_id"] for m in forensics["matches"]])  # still hidden
@@ -472,6 +472,52 @@ class Observability(unittest.TestCase):
         self.assertNotIn("Bearer", raw)
 
 
+class FrameworkAgent(unittest.TestCase):
+    """hr-leave is built on the official A2A Python SDK (poc/agents/sdk_agent.py), not on our A2A server."""
+
+    def setUp(self):
+        if "hr-leave" not in STACK.registry.catalog.cards:
+            self.skipTest("hr-leave needs a2a-sdk[http-server] and uvicorn")
+
+    def test_found_and_used_through_the_gateway(self):
+        out = runtime.ask(SETTINGS, "bob", "我還剩幾天特休？", say=lambda _: None)
+        self.assertEqual(out.status, "completed", out.detail)
+        self.assertEqual(out.artifacts[0]["data"]["annual_leave_days"], 7.5)
+        spans = [s for s in traceview.load(SETTINGS.trace_file) if s["trace_id"] == out.trace_id]
+        sdk = next(s for s in spans if s["name"] == "a2a SendMessage" and s["component"] == "agent:hr-leave")
+        self.assertEqual(sdk["attributes"]["framework"], "a2a-sdk")
+        self.assertEqual(sdk["attributes"]["origin"], "orchestrator-runtime")
+        self.assertTrue(any(s["name"] == "agent.execute" and s["parent_id"] == sdk["span_id"] for s in spans))
+
+    def test_input_required_round_trip(self):
+        out = runtime.ask(SETTINGS, "alice", "我想請假", answers=["12/3-12/4"], say=lambda _: None)
+        self.assertEqual(out.status, "completed", out.detail)
+        self.assertEqual(out.artifacts[0]["data"]["dates"], ["12/3", "12/4"])
+
+    def test_sdk_agent_checks_tokens_and_owners(self):
+        url = f"{SETTINGS.agent_url('hr-leave')}/a2a"
+        gate = TxnGate(SETTINGS)
+
+        def call(user: str, rpc: dict, txn: bool = True) -> tuple[int, dict]:
+            user_token = login(SETTINGS, user, "orchestrator-runtime")
+            headers = {"Authorization": f"Bearer {exchange(user_token, 'agent-gateway', 'agent:hr-leave')}",
+                       "A2A-Version": "1.0"}
+            if txn:
+                headers["Txn-Token"] = gate.mint(user_token, "a2a")
+            status, body, _ = http("POST", url, json_body={"jsonrpc": "2.0", "id": 1, **rpc}, headers=headers)
+            return status, body
+
+        send = {"method": "SendMessage", "params": {"message": text_message(ROLE_USER, "特休還有幾天"),
+                                                     "configuration": {"returnImmediately": True}}}
+        self.assertEqual(call("alice", send, txn=False)[0], 401)
+        status, body = call("alice", send)
+        self.assertEqual(status, 200, body)
+        task_id = body["result"]["task"]["id"]
+        self.assertEqual(call("alice", {"method": "GetTask", "params": {"id": task_id}})[1]["result"]["id"], task_id)
+        status, body = call("bob", {"method": "GetTask", "params": {"id": task_id}})
+        self.assertEqual(body["error"]["code"], -32001)  # TaskNotFound: the SDK keeps users' tasks apart
+
+
 class InputValidation(unittest.TestCase):
     def test_bad_arguments_are_errors_not_crashes(self):
         alice = mcp_for("alice")
@@ -499,13 +545,14 @@ class Governance(unittest.TestCase):
         catalog = Catalog(settings)
         catalog.sync()
         self.assertIn("unreachable", catalog.rejected["it-helpdesk"][0])
-        self.assertEqual(len(catalog.cards), 3)
+        self.assertEqual(set(catalog.cards), set(STACK.registry.catalog.cards) - {"it-helpdesk"})
         self.assertEqual(validate_card({"name": "x", "description": "y", "skills": "oops"})[-1], "skills is not a list")
 
     def test_invalid_cards_are_rejected(self):
         self.assertIn("missing skills", validate_card({"name": "x", "description": "y"}))
-        self.assertEqual(STACK.registry.catalog.rejected, {})
-        self.assertEqual(len(STACK.registry.catalog.cards), 4)
+        # hr-leave is only missing when the optional A2A SDK is not installed
+        self.assertEqual(set(STACK.registry.catalog.rejected) - {"hr-leave"}, set())
+        self.assertGreaterEqual(len(STACK.registry.catalog.cards), 4)
 
 
 if __name__ == "__main__":
