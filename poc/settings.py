@@ -36,6 +36,8 @@ class Settings:
         "POC_AGENTGATEWAY_BIN", ROOT / "bin" / _AGENTGATEWAY_ASSET)))
     # Multiplier for simulated agent work time (tests use a smaller value).
     speed: float = field(default_factory=lambda: float(os.environ.get("POC_SPEED", "1.0")))
+    # OTLP/HTTP endpoint for traces (e.g. Jaeger at http://127.0.0.1:4318); empty = JSONL file only
+    otlp_endpoint: str = field(default_factory=lambda: os.environ.get("POC_OTLP_ENDPOINT", ""))
     # Upper bound for one blocking Task Resource read; must stay below MCP client timeouts.
     resource_wait_seconds: float = field(default_factory=lambda: float(os.environ.get("POC_RESOURCE_WAIT", "20")))
 

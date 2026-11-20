@@ -1,11 +1,14 @@
-"""W3C Trace Context propagation with a JSONL span exporter.
+"""W3C Trace Context propagation with two span exporters.
 
-Spans are written to var/traces.jsonl. The shape mirrors OpenTelemetry
-(trace_id/span_id/parent_id/attributes) so an OTLP exporter can replace it later.
+- var/traces.jsonl, always (read by `python -m poc trace` and the tests)
+- OTLP/HTTP (JSON encoding) when an endpoint is configured, e.g. Jaeger from
+  observability/docker-compose.yml. Each component becomes its own service.name.
 """
 from __future__ import annotations
 
 import json
+import logging
+import queue
 import secrets
 import threading
 import time
@@ -16,15 +19,25 @@ from typing import Any, Iterator
 _local = threading.local()
 _write_lock = threading.Lock()
 _path: Path | None = None
+_otlp: "_OtlpExporter | None" = None
+log = logging.getLogger("poc.trace")
 
 # Credentials must never reach telemetry.
 _FORBIDDEN_KEYS = ("token", "authorization", "secret", "password", "groups", "roles")
 
 
-def configure(path: Path) -> None:
-    global _path
+def configure(path: Path, otlp_endpoint: str = "") -> None:
+    global _path, _otlp
     path.parent.mkdir(parents=True, exist_ok=True)
     _path = path
+    if otlp_endpoint and (_otlp is None or _otlp.url != f"{otlp_endpoint.rstrip('/')}/v1/traces"):
+        _otlp = _OtlpExporter(otlp_endpoint)
+
+
+def flush(timeout: float = 5.0) -> None:
+    """Wait until queued spans have been sent to the OTLP endpoint (no-op without one)."""
+    if _otlp is not None:
+        _otlp.flush(timeout)
 
 
 def parse_traceparent(value: str | None) -> tuple[str | None, str | None]:
@@ -92,3 +105,72 @@ def _export(s: Span, end: float) -> None:
     line = json.dumps(record, ensure_ascii=False) + "\n"
     with _write_lock, open(_path, "a", encoding="utf-8") as f:
         f.write(line)
+    if _otlp is not None:
+        _otlp.submit(record)
+
+
+def _otlp_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, bool):
+        return {"boolValue": value}
+    if isinstance(value, int):
+        return {"intValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    return {"stringValue": str(value)}
+
+
+def to_otlp(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """OTLP/HTTP JSON body (ids are hex strings, times are nanosecond strings)."""
+    by_service: dict[str, list[dict[str, Any]]] = {}
+    for r in records:
+        span = {
+            "traceId": r["trace_id"], "spanId": r["span_id"], "name": r["name"], "kind": 1,
+            "startTimeUnixNano": str(int(r["start"] * 1e9)), "endTimeUnixNano": str(int(r["end"] * 1e9)),
+            "attributes": [{"key": k, "value": _otlp_value(v)} for k, v in r["attributes"].items()],
+            "status": {"code": 2 if r["status"] == "error" else 1},
+        }
+        if r["parent_id"]:
+            span["parentSpanId"] = r["parent_id"]
+        by_service.setdefault(r["component"], []).append(span)
+    return {"resourceSpans": [
+        {"resource": {"attributes": [{"key": "service.name", "value": {"stringValue": service}}]},
+         "scopeSpans": [{"scope": {"name": "a2a-poc"}, "spans": spans}]}
+        for service, spans in by_service.items()]}
+
+
+class _OtlpExporter:
+    """Batches spans on a background thread so requests never wait on the collector."""
+
+    def __init__(self, endpoint: str):
+        self.url = f"{endpoint.rstrip('/')}/v1/traces"
+        self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=10000)
+        threading.Thread(target=self._run, name="otlp-exporter", daemon=True).start()
+
+    def submit(self, record: dict[str, Any]) -> None:
+        try:
+            self._queue.put_nowait(record)
+        except queue.Full:
+            pass  # telemetry must never block or break a request
+
+    def flush(self, timeout: float) -> None:
+        deadline = time.time() + timeout
+        while self._queue.unfinished_tasks and time.time() < deadline:
+            time.sleep(0.05)
+
+    def _run(self) -> None:
+        from poc.common.web import http  # late import: web does not depend on trace
+        while True:
+            batch = [self._queue.get()]
+            while len(batch) < 200:
+                try:
+                    batch.append(self._queue.get(timeout=0.5))
+                except queue.Empty:
+                    break
+            try:
+                status, body, _ = http("POST", self.url, json_body=to_otlp(batch), timeout=5)
+                if status >= 300:
+                    log.warning("OTLP export got HTTP %s: %s", status, body)
+            except OSError as e:
+                log.warning("OTLP export failed: %s", e)
+            for _ in batch:
+                self._queue.task_done()

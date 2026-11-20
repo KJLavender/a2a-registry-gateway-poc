@@ -36,7 +36,7 @@ Keycloak :18080  選用，真的 Keycloak（keycloak/docker-compose.yml）
 | `poc/keycloak_realm.py` + `keycloak/` | 用同一份設定產生的 Keycloak realm，以及啟動它的 compose 檔 |
 | `poc/pdp.py` + `poc/approvals.py` | A2A 呼叫的政策決策服務（兩種 Gateway 共用）和核准申請 |
 | `poc/keycloak_delegation.py` | Keycloak 委派的設定，以及委派測試用的瀏覽器式登入 |
-| `poc/common/trace.py` | 每一段都帶著 W3C trace context，寫到 `var/traces.jsonl` |
+| `poc/common/trace.py` | 每一段都帶著 W3C trace context，寫到 `var/traces.jsonl`，也可以用 OTLP 送出 |
 | `tests/` | 20 個驗收測試（搜尋、授權、核准、非同步 Task、trace）和 6 個 Keycloak 委派測試 |
 
 所有 Agent 的資料都是模擬的，不會碰到任何真實系統。
@@ -113,7 +113,7 @@ launcher 會根據 `config/policy.json` 產生 `var/agentgateway.yaml`，再啟�
 | 行為 | 內建 Gateway | agentgateway |
 |---|---|---|
 | 政策改動生效 | 下一個請求就生效 | 工具規則：約 0.4 秒後，等設定檔重新載入。A2A 的判斷（PDP）：下一個請求就生效 |
-| Gateway 的 span | 在 `var/traces.jsonl` | 不會寫到那裡；它的 access log 有同一個 trace id |
+| Gateway 的 span | 在 `var/traces.jsonl` | agentgateway 自己送到 OTLP 收集端（見下面的 Jaeger），不在 JSONL 裡 |
 | Task 擁有者檢查 | Gateway 檢查一次，Agent 再檢查一次 | 只有 Registry 和 Agent 檢查；Gateway 看不到 Task 屬於誰 |
 | 搜尋結果的權限提示 | Gateway 提供的端點 | Registry 自己讀 `policy.json` 判斷（只是提示，真正的判斷在 agentgateway） |
 
@@ -167,6 +167,23 @@ POC_IDP=keycloak python -m unittest tests.test_keycloak_delegation -v
 
 結論：委派適合單跳，也就是一個 Agent 直接代替使用者做事。PoC 的多跳流程繼續用 origin scope 的做法。如果要在多跳裡用委派，得讓一個元件（Gateway）保管使用者的 token 並自己換出每一跳的 token，或改用在內部服務間傳遞的單次請求 token（OAuth Transaction Tokens，目前還是 IETF 草案）。
 
+## 在 Jaeger 看完整的 trace
+
+每個元件都會把 span 寫到 `var/traces.jsonl`（`python -m poc trace` 可以印出來）。如果要在同一個畫面看一個請求經過的所有服務，包含 agentgateway 自己的 span，就啟動 Jaeger 並讓 PoC 送過去：
+
+```bash
+docker compose -f observability/docker-compose.yml up -d        # Jaeger 畫面在 http://127.0.0.1:16686
+POC_OTLP_ENDPOINT=http://127.0.0.1:4318 POC_GATEWAY=agentgateway python -m poc up
+POC_OTLP_ENDPOINT=http://127.0.0.1:4318 python -m poc ask alice "幫我分析今天晨會報表的良率異常"
+```
+
+實測一個請求會變成一條 trace：57 個 span、6 個服務（frontend、runtime、agentgateway、registry、PDP、agent），只有一個起點，中間沒有斷掉。要做到這樣，有兩件事要處理：
+
+- agentgateway 是從 HTTP 的 `traceparent` header 讀 trace，不看 MCP 的 `params._meta`，所以 runtime 兩邊都要帶。只帶 `_meta` 的話，一開啟 agentgateway 的 tracing，每個 tool call 都會變成新的一條 trace。
+- agentgateway 大約每 5 秒批次送一次 span。如果馬上把它關掉，最後一批會遺失，所以有設定 OTLP 時，launcher 會先等一下再關。
+
+agentgateway 1.7 已經把 `config.tracing` 標為過時，產生的設定改用 `frontendPolicies.tracing`。
+
 ## 選用：讓 Agent 用真的 LLM 回答
 
 預設 Agent 回固定的文字，測試結果才會穩定。設定 `POC_LLM=claude` 後，Agent 的回覆和 demo runtime 挑選 Agent 都會改用本機的 `claude` CLI（走你的 Claude 訂閱，不需要 API key）。`POC_LLM_MODEL` 可以換模型，預設 `sonnet`。
@@ -177,6 +194,7 @@ POC_IDP=keycloak python -m unittest tests.test_keycloak_delegation -v
 |---|---|---|
 | `POC_SPEED` | `1.0` | 模擬 Agent 工作時間的倍率 |
 | `POC_RESOURCE_WAIT` | `20` | 一次 Task resource 讀取最多等幾秒；要小於 MCP client 的逾時設定 |
+| `POC_OTLP_ENDPOINT` | 空 | trace 的 OTLP/HTTP 收集端，例如 `http://127.0.0.1:4318`（Jaeger） |
 | `POC_IDP` | `mock` | 設成 `keycloak` 就改用 18080 埠的 Keycloak，不用模擬 IdP |
 | `POC_GATEWAY` | `builtin` | 設成 `agentgateway` 就改用 agentgateway 執行檔，不用 `poc/gateway.py` |
 | `POC_AGENTGATEWAY_BIN` | `bin/agentgateway-windows-amd64.exe` | agentgateway 執行檔的路徑 |

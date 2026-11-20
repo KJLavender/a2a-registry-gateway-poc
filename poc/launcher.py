@@ -40,6 +40,8 @@ class Stack:
 
     def close(self) -> None:
         self._stop.set()
+        if self.agentgateway is not None and self.settings.otlp_endpoint:
+            time.sleep(6)  # agentgateway batches spans (~5 s); a hard stop on Windows would drop them
         _stop_process(self.agentgateway)
         _close_servers(self.servers)
 
@@ -124,7 +126,7 @@ def start_stack(settings: Settings) -> Stack:
 
 def _start(settings: Settings, servers: list[ThreadingHTTPServer]) -> Stack:
     settings.var_dir.mkdir(parents=True, exist_ok=True)
-    trace.configure(settings.trace_file)
+    trace.configure(settings.trace_file, settings.otlp_endpoint)
     if settings.idp_impl == "keycloak":
         _require_keycloak(settings)
     else:

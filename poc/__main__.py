@@ -54,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
         print(traceview.render(spans, trace_id) if trace_id else "no traces yet")
         return 0
 
+    from poc.common import trace
+    trace.configure(settings.trace_file, settings.otlp_endpoint)  # also when talking to a running stack
     stack = None
     if args.command == "up" or not _running(settings):
         from poc.launcher import start_stack
@@ -64,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _run(args, settings, stack)
     finally:
+        trace.flush()
         if stack:
             stack.close()
     return 0

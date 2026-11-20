@@ -36,7 +36,7 @@ Keycloak :18080  optional, the real thing (keycloak/docker-compose.yml)
 | `poc/keycloak_realm.py` + `keycloak/` | Keycloak realm generated from the same config, and a compose file to run it |
 | `poc/pdp.py` + `poc/approvals.py` | Policy decision point for A2A calls (used by both gateways) and the approval requests |
 | `poc/keycloak_delegation.py` | Keycloak delegation setup and a browser-style login for the delegation tests |
-| `poc/common/trace.py` | W3C trace context across every hop, written to `var/traces.jsonl` |
+| `poc/common/trace.py` | W3C trace context across every hop, written to `var/traces.jsonl` and optionally sent over OTLP |
 | `tests/` | 20 acceptance tests (discovery, authorization, approvals, async tasks, tracing) and 6 Keycloak delegation tests |
 
 All agent data is simulated. No real system is touched.
@@ -113,7 +113,7 @@ All tests pass with both gateways. What is still different:
 | Behavior | Built-in gateway | agentgateway |
 |---|---|---|
 | Policy change takes effect | On the next request | Tool rules: about 0.4 s later, after the config file reload. A2A decisions (PDP): next request |
-| Gateway spans | In `var/traces.jsonl` | Not exported there; its access log has the same trace id |
+| Gateway spans | In `var/traces.jsonl` | Sent by agentgateway to the OTLP collector (see Jaeger below); not in the JSONL file |
 | Task ownership | Checked at the gateway and again in the agent | Only in the registry and the agent; the gateway cannot see task owners |
 | Search access hints | Gateway endpoint | The registry evaluates `policy.json` itself (hints only; agentgateway makes the real decision) |
 
@@ -167,6 +167,23 @@ POC_IDP=keycloak python -m unittest tests.test_keycloak_delegation -v
 
 So delegation fits a single hop: one agent acting directly for the user. For the PoC's multi-hop chain the PoC keeps the origin-scope approach. Using delegation across hops would need one component (the gateway) to keep the user's token and mint every downstream token itself, or a separate per-request token passed between internal services (OAuth Transaction Tokens, still an IETF draft).
 
+## See whole traces in Jaeger
+
+Every component writes spans to `var/traces.jsonl` (`python -m poc trace` prints them). To see one request across all services, including agentgateway's own spans, start Jaeger and point the PoC at it:
+
+```bash
+docker compose -f observability/docker-compose.yml up -d        # Jaeger UI at http://127.0.0.1:16686
+POC_OTLP_ENDPOINT=http://127.0.0.1:4318 POC_GATEWAY=agentgateway python -m poc up
+POC_OTLP_ENDPOINT=http://127.0.0.1:4318 python -m poc ask alice "幫我分析今天晨會報表的良率異常"
+```
+
+In our run one request became a single trace of 57 spans from six services (frontend, runtime, agentgateway, registry, PDP, agent) with one root and no broken links. Two things were needed for that:
+
+- agentgateway reads the trace context from the HTTP `traceparent` header, not from MCP's `params._meta`, so the runtime sends both. With only `_meta`, every tool call started a new trace once agentgateway tracing was on.
+- agentgateway sends spans in batches about every 5 seconds. A process that stops it right away loses the last batch, so the launcher waits before stopping it when an OTLP endpoint is set.
+
+`config.tracing` is deprecated in agentgateway 1.7; the generated config uses `frontendPolicies.tracing`.
+
 ## Optional: real LLM answers
 
 Agents use canned text by default so tests stay stable. With `POC_LLM=claude`, agents write their answers and the demo runtime picks agents through the local `claude` CLI (your Claude subscription, no API key). `POC_LLM_MODEL` picks the model, default `sonnet`.
@@ -177,6 +194,7 @@ Agents use canned text by default so tests stay stable. With `POC_LLM=claude`, a
 |---|---|---|
 | `POC_SPEED` | `1.0` | Multiplier for simulated agent work time |
 | `POC_RESOURCE_WAIT` | `20` | Max seconds one task resource read waits; keep it below your MCP client's timeout |
+| `POC_OTLP_ENDPOINT` | empty | OTLP/HTTP collector for traces, e.g. `http://127.0.0.1:4318` (Jaeger) |
 | `POC_IDP` | `mock` | `keycloak` to use Keycloak on port 18080 instead of the mock IdP |
 | `POC_GATEWAY` | `builtin` | `agentgateway` to use the agentgateway binary instead of `poc/gateway.py` |
 | `POC_AGENTGATEWAY_BIN` | `bin/agentgateway-windows-amd64.exe` | Path to the agentgateway binary |

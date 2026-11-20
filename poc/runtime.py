@@ -40,9 +40,12 @@ class McpClient:
         self.session_id: str | None = None
         self.extra_headers: dict[str, str] = {}
 
-    def _post(self, payload: dict[str, Any], timeout: float) -> tuple[int, Any, dict[str, str]]:
+    def _post(self, payload: dict[str, Any], timeout: float,
+              traceparent: str | None = None) -> tuple[int, Any, dict[str, str]]:
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json, text/event-stream",
                    "MCP-Protocol-Version": self.protocol_version}
+        if traceparent:  # proxies such as agentgateway read the HTTP header, not params._meta
+            headers["traceparent"] = traceparent
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
         headers.update(self.extra_headers)
@@ -54,7 +57,8 @@ class McpClient:
         if traceparent:
             params["_meta"] = {"traceparent": traceparent}  # MCP SEP-414
         rid = str(uuid.uuid4())
-        status, body, headers = self._post({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, timeout)
+        status, body, headers = self._post({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, timeout,
+                                           traceparent)
         if isinstance(body, str) and headers.get("content-type", "").startswith("text/event-stream"):
             body = _from_sse(body, rid)
         if isinstance(body, dict) and isinstance(body.get("error"), dict):

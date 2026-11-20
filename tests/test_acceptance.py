@@ -323,8 +323,9 @@ class Observability(unittest.TestCase):
         ids = {s["span_id"] for s in spans}
         orphans = [s for s in spans if s["parent_id"] and s["parent_id"] not in ids]
         if AGW:
-            # agentgateway's own spans are not exported to our JSONL; its access log carries the same trace id
-            self.assertTrue(all(s["component"].startswith("agent:") for s in orphans))
+            # agentgateway joins the trace (it reads the traceparent header) but its own spans go to an OTLP
+            # collector, not our JSONL: services behind it point at parents we do not have here.
+            self.assertFalse([s for s in orphans if s["component"] in ("frontend", "runtime")])
             gateway_log = (SETTINGS.var_dir / "agentgateway.log").read_text(encoding="utf-8")
             self.assertIn(f"trace.id={out.trace_id}", gateway_log)
             self.assertNotIn("eyJ", gateway_log)

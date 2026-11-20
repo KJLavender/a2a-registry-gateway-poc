@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from urllib.parse import urlsplit
 
 from poc.settings import Settings
 
@@ -111,7 +112,13 @@ def build(settings: Settings) -> dict[str, Any]:
                          "a2a": {}},
             "backends": [{"host": f"{settings.host}:{port}", "policies": exchange(f"agent:{agent_id}")}],
         })
-    return {"binds": [{"port": settings.gateway_port, "listeners": [{"routes": routes}]}]}
+    config: dict[str, Any] = {"binds": [{"port": settings.gateway_port, "listeners": [{"routes": routes}]}]}
+    if settings.otlp_endpoint:  # same collector as the Python services, so one trace shows every hop
+        collector = urlsplit(settings.otlp_endpoint)
+        config["frontendPolicies"] = {"tracing": {
+            "host": collector.netloc, "protocol": "http", "path": "/v1/traces",
+            "resources": {"service.name": '"agentgateway"'}, "randomSampling": "true"}}
+    return config
 
 
 def write(settings: Settings) -> str:

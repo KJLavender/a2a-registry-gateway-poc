@@ -1,0 +1,9 @@
+# Jaeger v2 (all-in-one, in memory) for the PoC's traces.
+# UI: http://127.0.0.1:16686   OTLP/HTTP: http://127.0.0.1:4318
+# Then run the PoC with POC_OTLP_ENDPOINT=http://127.0.0.1:4318
+services:
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0
+    ports:
+      - "127.0.0.1:16686:16686"
+      - "127.0.0.1:4318:4318"
