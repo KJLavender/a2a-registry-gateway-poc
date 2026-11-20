@@ -7,6 +7,8 @@ Routes
                                         (poc/txn.py), which agentgateway passes on to the registry.
   GET  /approvals                       pending requests the caller may decide, plus the caller's own
   POST /approvals/{id}/approve|reject   decide a request (approver rule from policy.json; not your own)
+  GET  /notifications                   the caller's approval notifications (poc/notify.py)
+  POST /notifications/read              {"ids": [...]} marks them read
 
 The built-in gateway uses `A2AAuthorizer` in-process, so both gateways make the same decisions.
 """
@@ -22,6 +24,7 @@ from poc.common.a2a import POLICY_DENIED, is_continuation, is_new_task
 from poc.common.identity import Principal, Verifier
 from poc.common.jwt import TokenError
 from poc.common.web import Request, Response, RpcError, rpc_response
+from poc.notify import Notifier
 from poc.policy import ALLOW, APPROVAL, Decision, PolicyStore
 from poc.settings import Settings
 from poc.txn import EDGE_A2A, HEADER as TXN_HEADER, TxnGate, mcp_purpose, purpose_allows
@@ -43,9 +46,10 @@ class A2AAuthorizer:
     - GetTask / CancelTask: allowed here; the agent only serves the task's owner.
     """
 
-    def __init__(self, policy: PolicyStore, approvals: ApprovalStore):
+    def __init__(self, policy: PolicyStore, approvals: ApprovalStore, notifier: Notifier | None = None):
         self.policy = policy
         self.approvals = approvals
+        self.notifier = notifier
 
     def continuation(self, p: Principal, agent_id: str) -> Decision:
         decision = self.policy.invocation(p, agent_id)
@@ -62,6 +66,8 @@ class A2AAuthorizer:
                                 approval_request_id=grant["id"])
             request = self.approvals.open_or_get(p.sub, p.username, agent_id)
             decision.approval_request_id = request["id"]
+            if self.notifier:
+                self.notifier.approval_requested(request)  # once per request; repeats are ignored
         return decision
 
 
@@ -71,12 +77,14 @@ def refusal(rid: Any, decision: Decision) -> Response:
 
 
 class PolicyDecisionPoint:
-    def __init__(self, settings: Settings, policy: PolicyStore, approvals: ApprovalStore, verify: Verifier):
+    def __init__(self, settings: Settings, policy: PolicyStore, approvals: ApprovalStore, verify: Verifier,
+                 notifier: Notifier | None = None):
         self.policy = policy
         self.approvals = approvals
         self.verify = verify
+        self.notifier = notifier
         self.txn = TxnGate(settings)  # the PDP is agentgateway's half of the trust-domain edge
-        self.authorizer = A2AAuthorizer(policy, approvals)
+        self.authorizer = A2AAuthorizer(policy, approvals, notifier)
 
     def __call__(self, req: Request) -> Response:
         if req.path == "/authz/a2a":  # agentgateway keeps the original method (GET for agent cards)
@@ -87,6 +95,10 @@ class PolicyDecisionPoint:
             return self._restore(req)
         if req.method == "GET" and req.path == "/approvals":
             return self._list(req)
+        if req.path == "/notifications" and req.method == "GET":
+            return self._inbox(req)
+        if req.path == "/notifications/read" and req.method == "POST":
+            return self._mark_read(req)
         m = _DECIDE_PATH.match(req.path)
         if req.method == "POST" and m:
             return self._decide(req, m.group(1), m.group(2) == "approve")
@@ -194,4 +206,27 @@ class PolicyDecisionPoint:
             except ApprovalError as e:
                 sp.set(error=str(e))
                 return Response(e.status, {"error": str(e)})
+        if self.notifier:
+            self.notifier.approval_decided(decided)
         return Response(200, decided)
+
+    def _inbox(self, req: Request) -> Response:
+        p = self._principal(req.bearer or "")
+        if isinstance(p, Response):
+            return p
+        items = self.notifier.inbox(p.username) if self.notifier else []
+        return Response(200, {"notifications": [
+            {"id": n["id"], "event": n["event"], "text": n["text"], "approval_id": n["approval_id"],
+             "read": n["read_at"] is not None, "webhook": n["webhook_status"]} for n in items]})
+
+    def _mark_read(self, req: Request) -> Response:
+        p = self._principal(req.bearer or "")
+        if isinstance(p, Response):
+            return p
+        try:
+            ids = req.json().get("ids", [])
+        except (ValueError, AttributeError):
+            ids = None
+        if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+            return Response(400, {"error": "ids must be a list of integers"})
+        return Response(200, {"marked": self.notifier.mark_read(p.username, ids) if self.notifier else 0})

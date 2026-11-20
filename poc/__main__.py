@@ -42,6 +42,8 @@ def main(argv: list[str] | None = None) -> int:
     p_decide.add_argument("approval_id")
     p_decide.add_argument("--as", dest="user", required=True)
     p_decide.add_argument("--reject", action="store_true")
+    p_inbox = sub.add_parser("inbox", help="show your approval notifications and mark them read")
+    p_inbox.add_argument("--as", dest="user", required=True)
     p_trace = sub.add_parser("trace", help="show a trace tree (default: latest request)")
     p_trace.add_argument("trace_id", nargs="?")
     args = parser.parse_args(argv)
@@ -101,6 +103,22 @@ def _run(args: argparse.Namespace, settings: Settings, stack) -> None:
         for a in out.artifacts:
             print(f"Artifact《{a['name']}》{a.get('text') or a.get('data')}")
         print(f"\ntrace：python -m poc trace {out.trace_id}")
+    elif args.command == "inbox":
+        from poc.common.identity import login
+        from poc.common.web import http
+        headers = {"Authorization": f"Bearer {login(settings, args.user, 'orchestrator-runtime')}"}
+        status, body, _ = http("GET", f"{settings.pdp_url}/notifications", headers=headers)
+        if status != 200:
+            print(status, body)
+            return 1
+        items = body["notifications"]
+        for n in items:
+            print(("  " if n["read"] else "* ") + f"[{n['event']}] {n['text']}")
+        if not items:
+            print("沒有通知")
+        unread = [n["id"] for n in items if not n["read"]]
+        if unread:
+            http("POST", f"{settings.pdp_url}/notifications/read", json_body={"ids": unread}, headers=headers)
     elif args.command in ("approvals", "approve"):
         import json
         from poc.common.identity import login

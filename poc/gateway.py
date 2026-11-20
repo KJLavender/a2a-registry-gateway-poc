@@ -30,6 +30,7 @@ from poc.common.identity import Principal, TokenExchanger, Verifier
 from poc.common.jwt import TokenError
 from poc.common.mcp import RESOURCE_NOT_FOUND, McpContext, McpServer, serve_mcp, tool_result
 from poc.common.web import Request, Response, RpcError, http, rpc_call, rpc_response
+from poc.notify import Notifier
 from poc.pdp import A2AAuthorizer, is_continuation, is_new_task, refusal
 from poc.policy import PolicyStore
 from poc.registry import parse_task_uri
@@ -99,11 +100,11 @@ class GatewayMcp(McpServer):
 
 class AgentGateway:
     def __init__(self, settings: Settings, policy: PolicyStore, verify: Verifier, exchanger: TokenExchanger,
-                 approvals: ApprovalStore):
+                 approvals: ApprovalStore, notifier: Notifier | None = None):
         self.settings = settings
         self.policy = policy
         self.approvals = approvals
-        self.authorizer = A2AAuthorizer(policy, approvals)
+        self.authorizer = A2AAuthorizer(policy, approvals, notifier)
         self.verify = verify
         self.exchanger = exchanger
         self.txn = TxnGate(settings)

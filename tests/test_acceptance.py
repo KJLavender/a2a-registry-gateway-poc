@@ -19,7 +19,7 @@ from poc import runtime, traceview
 from poc.agents.base import A2AAgent
 from poc.common.a2a import ROLE_USER, text_message
 from poc.common.identity import ACCESS_TOKEN_TYPE, TOKEN_EXCHANGE, JwksCache, login
-from poc.common.web import Response, RpcError, free_port, http
+from poc.common.web import Request, Response, RpcError, free_port, http, serve
 from poc.launcher import Stack, start_stack
 from poc.registry import Catalog, validate_card
 from poc.runtime import McpClient
@@ -29,6 +29,16 @@ from poc.txn import TxnGate
 STACK: Stack
 SETTINGS: Settings
 _TMP: Path
+WEBHOOK: list[dict] = []  # approval notifications the fake chat service accepted
+
+
+def _fake_chat_webhook(req: Request) -> Response:
+    """Accepts approval notifications, but fails the very first post so the retry path is exercised."""
+    if not getattr(_fake_chat_webhook, "failed_once", False):
+        _fake_chat_webhook.failed_once = True
+        return Response(503, {"error": "try later"})
+    WEBHOOK.append(req.json())
+    return Response(200, {"ok": True})
 AGW = Settings(agent_ports={"_": 0}).gateway_impl == "agentgateway"
 
 
@@ -43,7 +53,10 @@ def setUpModule() -> None:
                         txn_port=free_port(),
                         agent_ports={a["agent_id"]: free_port() for a in agents},
                         speed=0.5, resource_wait_seconds=4)
+    hook_port = free_port()
+    SETTINGS.approval_webhook = f"http://127.0.0.1:{hook_port}/hook"
     STACK = start_stack(SETTINGS)
+    STACK.servers.append(serve(_fake_chat_webhook, "127.0.0.1", hook_port))
 
 
 def tearDownModule() -> None:
@@ -78,6 +91,22 @@ def a2a_post(path: str, token: str, rpc: dict, txn: str | None = None) -> tuple[
         headers["Txn-Token"] = txn
     status, body, _ = http("POST", f"{SETTINGS.gateway_url}{path}", json_body=rpc, headers=headers)
     return status, body
+
+
+def inbox(user: str) -> list[dict]:
+    status, body, _ = http("GET", f"{SETTINGS.pdp_url}/notifications",
+                           headers={"Authorization": f"Bearer {login(SETTINGS, user, 'orchestrator-runtime')}"})
+    assert status == 200, body
+    return body["notifications"]
+
+
+def wait_for(predicate, limit: float = 8) -> bool:
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def read_until_done(mcp: McpClient, uri: str, limit: float = 20) -> dict:
@@ -350,8 +379,19 @@ class TransactionTokens(unittest.TestCase):
                         headers={"Authorization": f"Bearer {login(SETTINGS, user, 'orchestrator-runtime')}"})[0]
         self.assertEqual(decide("dave"), 403)   # not an approver, and it is his own request
         self.assertEqual(decide("bob"), 403)    # not an approver
+        # carol (an approver) was told once, in her inbox and in chat; the requester was not
+        requested = [n for n in inbox("carol") if n["approval_id"] == approval_id]
+        self.assertEqual([n["event"] for n in requested], ["approval.requested"])
+        self.assertIn(f"approve {approval_id} --as carol", requested[0]["text"])
+        self.assertFalse([n for n in inbox("dave") if n["approval_id"] == approval_id])
+        self.assertTrue(wait_for(lambda: any(w["approval_id"] == approval_id and w["recipient"] == "carol"
+                                             for w in WEBHOOK)))  # delivered after one failed attempt
+
         self.assertEqual(decide("carol"), 200)  # has expense.approve
         self.assertEqual(decide("carol"), 409)  # already decided
+        decided = [n for n in inbox("dave") if n["approval_id"] == approval_id]
+        self.assertEqual([n["event"] for n in decided], ["approval.decided"])
+        self.assertIn("carol", decided[0]["text"])
 
         found, _ = dave.call_tool("search_agents", {"query": "交通費報銷"})
         self.assertEqual(found["matches"][0]["access"], "allowed")

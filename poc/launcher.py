@@ -20,6 +20,7 @@ from poc.common.web import http, serve
 from poc.gateway import AgentGateway
 from poc.idp import IdentityProvider, make_app
 from poc.approvals import ApprovalStore
+from poc.notify import Notifier
 from poc.pdp import PolicyDecisionPoint
 from poc.policy import PolicyStore
 from poc.registry import AgentRegistry
@@ -146,12 +147,16 @@ def _start(settings: Settings, servers: list[ThreadingHTTPServer]) -> Stack:
 
     policy = PolicyStore(settings.config_dir / "policy.json")
     approvals = ApprovalStore(settings.var_dir / "approvals.db")
-    servers.append(serve(PolicyDecisionPoint(settings, policy, approvals, verify), settings.host, settings.pdp_port))
+    notifier = Notifier(settings, policy, settings.var_dir / "approvals.db")
+    stop = threading.Event()
+    threading.Thread(target=notifier.run, args=(stop,), name="approval-notifications", daemon=True).start()
+    servers.append(serve(PolicyDecisionPoint(settings, policy, approvals, verify, notifier), settings.host,
+                         settings.pdp_port))
 
     if settings.gateway_impl == "agentgateway":
-        stack = Stack(settings, servers, agents, registry, None, _start_agentgateway(settings))
+        stack = Stack(settings, servers, agents, registry, None, _start_agentgateway(settings), _stop=stop)
         threading.Thread(target=_regenerate_on_policy_change, args=(stack,), daemon=True).start()
         return stack
-    gateway = AgentGateway(settings, policy, verify, TokenExchanger(settings, "agent-gateway"), approvals)
+    gateway = AgentGateway(settings, policy, verify, TokenExchanger(settings, "agent-gateway"), approvals, notifier)
     servers.append(serve(gateway, settings.host, settings.gateway_port))
-    return Stack(settings, servers, agents, registry, gateway)
+    return Stack(settings, servers, agents, registry, gateway, _stop=stop)

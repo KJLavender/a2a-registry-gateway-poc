@@ -39,6 +39,8 @@ class Settings:
     speed: float = field(default_factory=lambda: float(os.environ.get("POC_SPEED", "1.0")))
     # OTLP/HTTP endpoint for traces (e.g. Jaeger at http://127.0.0.1:4318); empty = JSONL file only
     otlp_endpoint: str = field(default_factory=lambda: os.environ.get("POC_OTLP_ENDPOINT", ""))
+    # Where approval notifications are POSTed (Slack/Mattermost incoming webhook); empty = inbox only
+    approval_webhook: str = field(default_factory=lambda: os.environ.get("POC_APPROVAL_WEBHOOK", ""))
     # Upper bound for one blocking Task Resource read; must stay below MCP client timeouts.
     resource_wait_seconds: float = field(default_factory=lambda: float(os.environ.get("POC_RESOURCE_WAIT", "20")))
 
