@@ -123,11 +123,17 @@ class Discovery(unittest.TestCase):
         missing, e2 = bob.call_tool("invoke_agent", {"agent_id": "no-such-agent", "message": "x"})
         self.assertTrue(e1 and e2)
         self.assertEqual(hidden["error"].replace("security-forensics", "X"), missing["error"].replace("no-such-agent", "X"))
-        status, _, _ = http("GET", f"{SETTINGS.gateway_url}/agents/security-forensics/.well-known/agent-card.json",
-                            headers={"Authorization": f"Bearer {login(SETTINGS, 'bob', 'orchestrator-runtime')}"})
-        # Known gap: agentgateway answers 403 (authorization failed) while an unknown path is 404,
-        # so the HTTP status reveals that the hidden agent exists. The registry still hides it.
-        self.assertEqual(status, 403 if AGW else 404)
+        # At the gateway, a hidden agent must look exactly like one that does not exist (status and body)
+        headers = {"Authorization": f"Bearer {login(SETTINGS, 'bob', 'orchestrator-runtime')}", "A2A-Version": "1.0"}
+        rpc = {"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {"message": text_message(ROLE_USER, "x")}}
+        for suffix, body in ((".well-known/agent-card.json", None), ("a2a", rpc)):
+            method = "GET" if body is None else "POST"
+            hidden = http(method, f"{SETTINGS.gateway_url}/agents/security-forensics/{suffix}", json_body=body,
+                          headers=headers)
+            missing = http(method, f"{SETTINGS.gateway_url}/agents/no-such-agent/{suffix}", json_body=body,
+                           headers=headers)
+            self.assertEqual(hidden[0], 404)
+            self.assertEqual(hidden[:2], missing[:2])
         erin, _ = mcp_for("erin").call_tool("search_agents", {"query": "調查可疑登入告警 資安鑑識"})
         self.assertEqual(erin["matches"][0]["agent_id"], "security-forensics")
 
@@ -203,8 +209,7 @@ class Authorization(unittest.TestCase):
         result, is_error = carol.call_tool("invoke_agent", {"agent_id": "expense-approver", "message": "12000 元 差旅"})
         self.assertTrue(is_error)
         self.assertEqual(result["effect"], "deny")
-        if not AGW:  # agentgateway's 403 does not say which rule refused the call
-            self.assertEqual(result["rule"], "delegation.report-analyst")
+        self.assertEqual(result["rule"], "delegation.report-analyst")  # both gateways explain the refusal
 
     def test_origin_header_cannot_be_spoofed(self):
         carol = mcp_for("carol", "report-runtime")
@@ -213,17 +218,34 @@ class Authorization(unittest.TestCase):
         self.assertTrue(is_error)
         self.assertEqual(result["effect"], "deny")
 
-    def test_approval_required(self):
+    def test_approval_flow(self):
         dave = mcp_for("dave")
         found, _ = dave.call_tool("search_agents", {"query": "交通費報銷"})
         self.assertEqual(found["matches"][0]["access"], "approval_required")
         result, is_error = dave.call_tool("invoke_agent", {"agent_id": "expense-approver", "message": "3000 元 交通"})
         self.assertTrue(is_error)
-        if AGW:  # CEL rules only allow or deny; there is no approval flow to hand off to
-            self.assertEqual(result["effect"], "deny")
-        else:
-            self.assertEqual(result["effect"], "approval_required")
-            self.assertTrue(result["approval_request_id"].startswith("APR-"))
+        self.assertEqual(result["effect"], "approval_required")
+        approval_id = result["approval_request_id"]
+        again, _ = dave.call_tool("invoke_agent", {"agent_id": "expense-approver", "message": "3000 元 交通"})
+        self.assertEqual(again["approval_request_id"], approval_id)  # one pending request, not a new one each time
+
+        def decide(user: str) -> int:
+            return http("POST", f"{SETTINGS.pdp_url}/approvals/{approval_id}/approve",
+                        headers={"Authorization": f"Bearer {login(SETTINGS, user, 'orchestrator-runtime')}"})[0]
+        self.assertEqual(decide("dave"), 403)   # not an approver, and it is his own request
+        self.assertEqual(decide("bob"), 403)    # not an approver
+        self.assertEqual(decide("carol"), 200)  # has expense.approve
+        self.assertEqual(decide("carol"), 409)  # already decided
+
+        found, _ = dave.call_tool("search_agents", {"query": "交通費報銷"})
+        self.assertEqual(found["matches"][0]["access"], "allowed")
+        inv, is_error = dave.call_tool("invoke_agent", {"agent_id": "expense-approver", "message": "3000 元 交通"})
+        self.assertFalse(is_error)
+        self.assertEqual(read_until_done(dave, inv["resource_uri"])["state"], "TASK_STATE_COMPLETED")
+        third, is_error = dave.call_tool("invoke_agent", {"agent_id": "expense-approver", "message": "3000 元 交通"})
+        self.assertTrue(is_error)  # an approval covers one invocation
+        self.assertEqual(third["effect"], "approval_required")
+        self.assertNotEqual(third["approval_request_id"], approval_id)
 
     def test_agent_rejects_user_token(self):
         token = login(SETTINGS, "alice", "orchestrator-runtime")

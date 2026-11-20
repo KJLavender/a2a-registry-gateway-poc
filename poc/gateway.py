@@ -15,17 +15,18 @@ Policies enforced here
 from __future__ import annotations
 
 import re
-import secrets
 import threading
 from typing import Any
 
+from poc.approvals import ApprovalStore
 from poc.common import trace
-from poc.common.a2a import POLICY_DENIED, TASK_NOT_FOUND
+from poc.common.a2a import TASK_NOT_FOUND
 from poc.common.identity import Principal, TokenExchanger, Verifier
 from poc.common.jwt import TokenError
 from poc.common.mcp import RESOURCE_NOT_FOUND, McpContext, McpServer, serve_mcp, tool_result
 from poc.common.web import Request, Response, RpcError, http, rpc_call, rpc_response
-from poc.policy import APPROVAL, Decision, PolicyStore
+from poc.pdp import A2AAuthorizer, refusal
+from poc.policy import PolicyStore
 from poc.registry import parse_task_uri
 from poc.settings import Settings
 
@@ -91,16 +92,18 @@ class GatewayMcp(McpServer):
 
 
 class AgentGateway:
-    def __init__(self, settings: Settings, policy: PolicyStore, verify: Verifier, exchanger: TokenExchanger):
+    def __init__(self, settings: Settings, policy: PolicyStore, verify: Verifier, exchanger: TokenExchanger,
+                 approvals: ApprovalStore):
         self.settings = settings
         self.policy = policy
+        self.approvals = approvals
+        self.authorizer = A2AAuthorizer(policy, approvals)
         self.verify = verify
         self.exchanger = exchanger
         self.mcp = GatewayMcp(self)
         self._task_owner: dict[str, tuple[str, str]] = {}  # task_id -> (agent_id, user)
         self._lock = threading.Lock()
         self._registry_tools: list[dict[str, Any]] | None = None
-        self.approvals: list[dict[str, Any]] = []
 
     # --- HTTP -------------------------------------------------------------------
 
@@ -161,11 +164,6 @@ class AgentGateway:
             interface["url"] = f"{self.settings.gateway_url}/agents/{agent_id}/a2a"
         return Response(200, card)
 
-    def _deny(self, rid: Any, decision: Decision, status: int = 403, **extra: Any) -> Response:
-        return Response(status, rpc_response(rid, error=RpcError(
-            POLICY_DENIED, f"Request refused by Agent Gateway policy: {decision.reason}",
-            {**decision.to_dict(), **extra})))
-
     def _a2a(self, req: Request, agent_id: str) -> Response:
         try:
             msg = req.json()
@@ -178,18 +176,15 @@ class AgentGateway:
         with trace.span(f"gateway a2a {method}", COMPONENT, req.headers.get("traceparent"), agent_id=agent_id,
                         user=p.username, delegation_path=" > ".join(p.actors)) as sp:
             new_task = method == "SendMessage" and not (params.get("message") or {}).get("taskId")
+            if not self.policy.visible(p, agent_id):
+                sp.set(policy_effect="deny", reason="agent hidden from user")
+                return Response(404, {"error": "not found"})  # identical to a path with no agent
             if new_task:
-                if not self.policy.visible(p, agent_id):
-                    sp.set(policy_effect="deny", reason="agent hidden from user")
-                    return Response(404, rpc_response(rid, error=RpcError(-32601, "agent not found")))
-                decision = self.policy.invocation(p, agent_id)  # authoritative, every time
-                sp.set(policy_effect=decision.effect, policy_rule=decision.rule, decision_id=decision.decision_id)
-                if decision.effect == APPROVAL:
-                    approval_id = self._open_approval(p, agent_id, decision)
-                    sp.set(approval_request_id=approval_id)
-                    return self._deny(rid, decision, approval_request_id=approval_id)
+                decision = self.authorizer.new_task(p, agent_id)
+                sp.set(policy_effect=decision.effect, policy_rule=decision.rule, decision_id=decision.decision_id,
+                       approval_request_id=decision.approval_request_id)
                 if not decision.allowed:
-                    return self._deny(rid, decision)
+                    return refusal(rid, decision)
             elif method in ("SendMessage", "GetTask", "CancelTask"):
                 task_id = params.get("id") if method != "SendMessage" else params["message"]["taskId"]
                 if not self.owns(p, agent_id, task_id):
@@ -210,13 +205,6 @@ class AgentGateway:
                 sp.set(task_id=task.get("id"), state=task["status"]["state"])
             return Response(status, body)
 
-    def _open_approval(self, p: Principal, agent_id: str, decision: Decision) -> str:
-        approval_id = f"APR-{secrets.token_hex(3).upper()}"
-        with self._lock:
-            self.approvals.append({"approval_request_id": approval_id, "user": p.sub, "agent_id": agent_id,
-                                   "decision_id": decision.decision_id, "status": "pending"})
-        return approval_id
-
     def _access_check(self, req: Request) -> Response:
         """Indications for search results. Never a substitute for the check in `_a2a`."""
         p = self._authenticate(req)
@@ -225,7 +213,7 @@ class AgentGateway:
         if p.immediate_actor != "agent-registry":
             return Response(403, {"error": "only the agent registry may call this endpoint"})
         with trace.span("gateway access-check", COMPONENT, req.headers.get("traceparent"), user=p.username) as sp:
-            out = {agent_id: self.policy.access_indication(p, agent_id)
+            out = {agent_id: self.policy.access_indication(p, agent_id, self.approvals.has_grant(p.sub, agent_id))
                    for agent_id in req.json().get("agent_ids", [])}
             sp.set(checked=len(out))
         return Response(200, out)

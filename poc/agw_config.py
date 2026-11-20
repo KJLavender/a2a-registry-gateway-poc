@@ -2,10 +2,11 @@
 
 Mapping
   tools/list + tools/call  -> mcpAuthorization CEL rules (agentgateway filters tools/list by the same rules)
-  A2A invocation           -> per-agent route `authorization` CEL rule (visibility + delegation + user rule)
+  A2A invocation           -> extAuthz to the policy decision point (poc/pdp.py), same logic as the
+                              built-in gateway: approvals, 404 for hidden agents, reasons in the error
   token exchange           -> backendAuth.oauthTokenExchange against the mock IdP (RFC 8693)
-What CEL cannot express here: approval_required (no approval flow) and task ownership
-(the gateway cannot see A2A task owners); those stay with the registry and the agents.
+Task ownership is not checked here (the gateway cannot see A2A task owners); the registry and the
+agents check it.
 """
 from __future__ import annotations
 
@@ -57,18 +58,6 @@ def mcp_rules(policy: dict[str, Any]) -> list[dict[str, str]]:
     return rules
 
 
-def a2a_rule(policy: dict[str, Any], agent_id: str) -> str:
-    agent = policy["agents"].get(agent_id)
-    if agent is None:
-        return "false"
-    callers = [c for c, targets in policy["delegation"].items() if "*" in targets or agent_id in targets]
-    runtimes = [r for r, cfg in policy["runtimes"].items() if cfg.get("agent_id") in callers]
-    parts = [f"{origin_client()} in {_list(runtimes)}", user_rule(agent["invoke"])]
-    if agent.get("visibility") == "hidden":
-        parts.insert(0, f"{_list(agent.get('visible_to_groups', []))}.exists(g, g in jwt.groups)")
-    return " && ".join(parts)
-
-
 def build(settings: Settings) -> dict[str, Any]:
     policy = settings.load("policy.json")
     jwt_auth = {"mode": "strict", "issuer": settings.issuer, "audiences": ["agent-gateway"],
@@ -85,6 +74,15 @@ def build(settings: Settings) -> dict[str, Any]:
             "subjectToken": {"source": {"expression": "jwt.rawToken.unredacted()"}},
         }}}
 
+    pdp_check = {
+        "host": f"{settings.host}:{settings.pdp_port}",
+        "protocol": {"http": {
+            "path": '"/authz/a2a"',
+            "addRequestHeaders": {"x-subject-token": "jwt.rawToken.unredacted()", "x-original-path": "request.path"},
+        }},
+        "includeRequestBody": {"maxRequestBytes": 65536},
+        "failureMode": {"denyWithStatus": 503},
+    }
     routes: list[dict[str, Any]] = [
         {"name": "healthz", "matches": [{"path": {"exact": "/healthz"}}],
          "policies": {"directResponse": {"status": 200, "body": list(b'{"status": "ok"}')}}},
@@ -105,7 +103,9 @@ def build(settings: Settings) -> dict[str, Any]:
             "name": f"a2a-{agent_id}",
             "matches": [{"path": {"pathPrefix": f"/agents/{agent_id}/"}}],
             "policies": {"jwtAuth": jwt_auth,
-                         "authorization": {"rules": [{"allow": a2a_rule(policy, agent_id)}]},
+                         # The PDP decides (approval flow, 404 for hidden agents, reasons in the error body).
+                         # CEL alone can only allow or deny with a 403.
+                         "extAuthz": pdp_check,
                          "urlRewrite": {"path": {"prefix": "/"}},
                          "a2a": {}},
             "backends": [{"host": f"{settings.host}:{port}", "policies": exchange(f"agent:{agent_id}")}],

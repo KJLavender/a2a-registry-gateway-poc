@@ -18,6 +18,8 @@ from poc.common.identity import TokenExchanger, make_verifier
 from poc.common.web import http, serve
 from poc.gateway import AgentGateway
 from poc.idp import IdentityProvider, make_app
+from poc.approvals import ApprovalStore
+from poc.pdp import PolicyDecisionPoint
 from poc.policy import PolicyStore
 from poc.registry import AgentRegistry
 from poc.settings import Settings
@@ -107,11 +109,14 @@ def start_stack(settings: Settings) -> Stack:
     servers.append(serve(registry, settings.host, settings.registry_port))
     registry.catalog.sync()
 
+    policy = PolicyStore(settings.config_dir / "policy.json")
+    approvals = ApprovalStore(settings.var_dir / "approvals.db")
+    servers.append(serve(PolicyDecisionPoint(policy, approvals, verify), settings.host, settings.pdp_port))
+
     if settings.gateway_impl == "agentgateway":
         stack = Stack(settings, servers, agents, registry, None, _start_agentgateway(settings))
         threading.Thread(target=_regenerate_on_policy_change, args=(stack,), daemon=True).start()
         return stack
-    gateway = AgentGateway(settings, PolicyStore(settings.config_dir / "policy.json"), verify,
-                           TokenExchanger(settings, "agent-gateway"))
+    gateway = AgentGateway(settings, policy, verify, TokenExchanger(settings, "agent-gateway"), approvals)
     servers.append(serve(gateway, settings.host, settings.gateway_port))
     return Stack(settings, servers, agents, registry, gateway)

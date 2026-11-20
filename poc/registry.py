@@ -29,6 +29,7 @@ from poc.common.identity import Principal, TokenExchanger, Verifier
 from poc.common.jwt import TokenError
 from poc.common.mcp import RESOURCE_NOT_FOUND, McpContext, McpServer, serve_mcp, tool_result
 from poc.common.web import Request, Response, RpcError, http, rpc_call
+from poc.approvals import ApprovalStore
 from poc.policy import PolicyStore
 from poc.search import AgentIndex
 from poc.settings import Settings
@@ -216,6 +217,7 @@ class AgentRegistry(McpServer):
         self.catalog = Catalog(settings)
         # Used for whoami and, behind agentgateway, for search access indications.
         self.policy = PolicyStore(settings.config_dir / "policy.json")
+        self.approvals = ApprovalStore(settings.var_dir / "approvals.db")
         settings.var_dir.mkdir(parents=True, exist_ok=True)
         self.tasks = TaskStore(str(settings.var_dir / "registry.db"))
 
@@ -256,7 +258,8 @@ class AgentRegistry(McpServer):
         if self.settings.gateway_impl == "agentgateway":
             # agentgateway has no indication endpoint; evaluate the same policy file locally.
             # It is only an indication: agentgateway's CEL rules make the real decision.
-            return {a: self.policy.access_indication(ctx.principal, a) for a in agent_ids}
+            p = ctx.principal
+            return {a: self.policy.access_indication(p, a, self.approvals.has_grant(p.sub, a)) for a in agent_ids}
         status, body, _ = http("POST", f"{self.settings.gateway_url}/internal/access-check",
                                json_body={"agent_ids": agent_ids}, headers=self._gateway_headers(ctx, sp))
         return body if status == 200 and isinstance(body, dict) else None

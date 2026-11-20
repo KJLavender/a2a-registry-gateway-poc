@@ -1,0 +1,135 @@
+"""Policy Decision Point service: A2A authorization for agentgateway (extAuthz) and the approval API.
+
+Routes
+  ANY  /authz/a2a                       agentgateway extAuthz (HTTP). 200 = allow; otherwise the status and
+                                        JSON-RPC error body are what the caller sees.
+  GET  /approvals                       pending requests the caller may decide, plus the caller's own
+  POST /approvals/{id}/approve|reject   decide a request (approver rule from policy.json; not your own)
+
+The built-in gateway uses `A2AAuthorizer` in-process, so both gateways make the same decisions.
+"""
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from poc.approvals import ApprovalError, ApprovalStore
+from poc.common import trace
+from poc.common.a2a import POLICY_DENIED
+from poc.common.identity import Principal, Verifier
+from poc.common.jwt import TokenError
+from poc.common.web import Request, Response, RpcError, rpc_response
+from poc.policy import ALLOW, APPROVAL, Decision, PolicyStore
+
+COMPONENT = "policy-decision-point"
+_AGENT_PATH = re.compile(r"^/agents/([a-z0-9-]+)/")
+_DECIDE_PATH = re.compile(r"^/approvals/(APR-[0-9A-F]+)/(approve|reject)$")
+# Same status and body agentgateway returns for a path no route matches, so a hidden agent
+# cannot be told apart from one that does not exist.
+NOT_FOUND = Response(404, "route not found", {"Content-Type": "text/plain"})
+
+
+class A2AAuthorizer:
+    def __init__(self, policy: PolicyStore, approvals: ApprovalStore):
+        self.policy = policy
+        self.approvals = approvals
+
+    def new_task(self, p: Principal, agent_id: str) -> Decision | None:
+        """None means the agent is hidden from this user (answer as if it does not exist)."""
+        if not self.policy.visible(p, agent_id):
+            return None
+        decision = self.policy.invocation(p, agent_id)  # authoritative, every time
+        if decision.effect == APPROVAL:
+            grant = self.approvals.take_grant(p.sub, agent_id)
+            if grant:
+                return Decision(ALLOW, f"approved by {grant['decided_by']}", decision.rule,
+                                approval_request_id=grant["id"])
+            request = self.approvals.open_or_get(p.sub, p.username, agent_id)
+            decision.approval_request_id = request["id"]
+        return decision
+
+
+def refusal(rid: Any, decision: Decision) -> Response:
+    return Response(403, rpc_response(rid, error=RpcError(
+        POLICY_DENIED, f"Request refused by Agent Gateway policy: {decision.reason}", decision.to_dict())))
+
+
+class PolicyDecisionPoint:
+    def __init__(self, policy: PolicyStore, approvals: ApprovalStore, verify: Verifier):
+        self.policy = policy
+        self.approvals = approvals
+        self.verify = verify
+        self.authorizer = A2AAuthorizer(policy, approvals)
+
+    def __call__(self, req: Request) -> Response:
+        if req.path == "/authz/a2a":  # agentgateway keeps the original method (GET for agent cards)
+            return self._authz(req)
+        if req.method == "GET" and req.path == "/approvals":
+            return self._list(req)
+        m = _DECIDE_PATH.match(req.path)
+        if req.method == "POST" and m:
+            return self._decide(req, m.group(1), m.group(2) == "approve")
+        if req.method == "GET" and req.path == "/healthz":
+            return Response(200, {"status": "ok"})
+        return Response(404, {"error": "not found"})
+
+    def _principal(self, token: str) -> Principal | Response:
+        try:
+            return Principal.from_claims(self.verify(token, "agent-gateway"))
+        except TokenError as e:
+            return Response(401, {"error": f"unauthorized: {e}"})
+
+    def _authz(self, req: Request) -> Response:
+        # agentgateway sends the validated token and original path as headers, the A2A body as the body
+        p = self._principal(req.headers.get("x-subject-token", ""))
+        if isinstance(p, Response):
+            return p
+        m = _AGENT_PATH.match(req.headers.get("x-original-path", ""))
+        if not m:
+            return NOT_FOUND
+        agent_id = m.group(1)
+        try:
+            rpc = json.loads(req.body or b"{}")
+        except ValueError:
+            rpc = {}
+        method = rpc.get("method")
+        new_task = method == "SendMessage" and not ((rpc.get("params") or {}).get("message") or {}).get("taskId")
+        with trace.span(f"pdp authz {method}", COMPONENT, req.headers.get("traceparent"),
+                        agent_id=agent_id, user=p.username) as sp:
+            if not self.policy.visible(p, agent_id):
+                sp.set(policy_effect="deny", reason="agent hidden from user")
+                return NOT_FOUND
+            if not new_task:
+                return Response(200, {"allow": True})  # task access is checked by the agent (owner only)
+            decision = self.authorizer.new_task(p, agent_id)
+            sp.set(policy_effect=decision.effect, policy_rule=decision.rule, decision_id=decision.decision_id,
+                   approval_request_id=decision.approval_request_id)
+            if decision.allowed:
+                return Response(200, {"allow": True})
+            return refusal(rpc.get("id"), decision)
+
+    def _list(self, req: Request) -> Response:
+        p = self._principal(req.bearer or "")
+        if isinstance(p, Response):
+            return p
+        rows = self.approvals.pending()
+        return Response(200, {
+            "to_decide": [r for r in rows if r["requester_sub"] != p.sub and self.policy.can_approve(p, r["agent_id"])],
+            "mine": [r for r in rows if r["requester_sub"] == p.sub],
+        })
+
+    def _decide(self, req: Request, approval_id: str, approve: bool) -> Response:
+        p = self._principal(req.bearer or "")
+        if isinstance(p, Response):
+            return p
+        row = self.approvals.get(approval_id)
+        may = row is not None and self.policy.can_approve(p, row["agent_id"])
+        with trace.span("pdp approval decision", COMPONENT, approval_request_id=approval_id, user=p.username,
+                        approve=approve) as sp:
+            try:
+                decided = self.approvals.decide(approval_id, p.sub, p.username, approve, may)
+            except ApprovalError as e:
+                sp.set(error=str(e))
+                return Response(e.status, {"error": str(e)})
+        return Response(200, decided)

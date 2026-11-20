@@ -23,7 +23,8 @@
     },
     "expense-approver": {
       "visibility": "listed",
-      "invoke": {"allow_roles": ["expense.approve"], "approval_groups": ["dept-finance"]}
+      "invoke": {"allow_roles": ["expense.approve"], "approval_groups": ["dept-finance"]},
+      "approvers": {"allow_roles": ["expense.approve"]}
     },
     "security-forensics": {
       "visibility": "hidden",

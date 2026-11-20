@@ -6,6 +6,7 @@ from typing import Callable
 
 from poc import runtime, traceview
 from poc.common.identity import login
+from poc.common.web import http
 from poc.runtime import McpClient
 from poc.settings import Settings
 
@@ -58,8 +59,22 @@ def run(settings: Settings, only: str | None = None) -> None:
              lambda: _show(runtime.ask(settings, "bob", "明天台北天氣如何")))
     scenario("5", "carol（財務、有簽核角色）沒寫金額 → INPUT_REQUIRED → provide_input",
              lambda: _show(runtime.ask(settings, "carol", "幫我申請差旅費報銷", answers=["12000 元 差旅"])))
-    scenario("6", "dave（財務、無簽核角色）→ 需要額外核准",
-             lambda: _show(runtime.ask(settings, "dave", "幫我申請 3000 元交通費報銷")))
+    def approval() -> None:
+        first = runtime.ask(settings, "dave", "幫我申請 3000 元交通費報銷")
+        _show(first)
+        approval_id = first.detail.get("approval_request_id")
+        if not approval_id:
+            return
+        for user in ("dave", "carol"):
+            status, body, _ = http("POST", f"{settings.pdp_url}/approvals/{approval_id}/approve",
+                                   headers={"Authorization": f"Bearer {login(settings, user, 'orchestrator-runtime')}"})
+            print(f"  {user} 核准 {approval_id} → HTTP {status} {body.get('error') or body.get('status')}")
+        print("  dave 再試一次：")
+        _show(runtime.ask(settings, "dave", "幫我申請 3000 元交通費報銷"))
+        print("  dave 第三次（核准只能用一次）：")
+        _show(runtime.ask(settings, "dave", "幫我申請 3000 元交通費報銷"))
+
+    scenario("6", "dave（財務、無簽核角色）→ 需要核准 → carol 核准 → 放行一次", approval)
     scenario("7", "資安鑑識 Agent 是隱藏的：bob 完全看不到，erin（SecOps）可以用",
              lambda: (_show(runtime.ask(settings, "bob", "調查昨晚的可疑登入告警")),
                       _show(runtime.ask(settings, "erin", "調查昨晚的可疑登入告警"))))

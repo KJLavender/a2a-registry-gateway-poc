@@ -20,6 +20,7 @@ class Settings:
     idp_port: int = 0  # 0 = default for idp_impl (mock 18300, keycloak 18080)
     gateway_port: int = 18000
     registry_port: int = 18200
+    pdp_port: int = 18400
     agent_ports: dict[str, int] = field(default_factory=dict)
     # "builtin" = poc/gateway.py; "agentgateway" = the agentgateway binary configured from policy.json
     gateway_impl: str = field(default_factory=lambda: os.environ.get("POC_GATEWAY", "builtin"))
@@ -65,6 +66,10 @@ class Settings:
     @property
     def registry_url(self) -> str:
         return self.url(self.registry_port)
+
+    @property
+    def pdp_url(self) -> str:
+        return self.url(self.pdp_port)
 
     def agent_url(self, agent_id: str) -> str:
         return self.url(self.agent_ports[agent_id])

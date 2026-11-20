@@ -27,13 +27,17 @@ class Decision:
     reason: str
     rule: str
     decision_id: str = field(default_factory=lambda: f"pd-{secrets.token_hex(6)}")
+    approval_request_id: str | None = None
 
     @property
     def allowed(self) -> bool:
         return self.effect == ALLOW
 
     def to_dict(self) -> dict[str, Any]:
-        return {"effect": self.effect, "reason": self.reason, "rule": self.rule, "decision_id": self.decision_id}
+        out = {"effect": self.effect, "reason": self.reason, "rule": self.rule, "decision_id": self.decision_id}
+        if self.approval_request_id:
+            out["approval_request_id"] = self.approval_request_id
+        return out
 
 
 def _matches(rule: dict[str, Any], p: Principal) -> bool:
@@ -100,9 +104,16 @@ class PolicyStore:
             return Decision(APPROVAL, "user may invoke after approval", f"agents.{agent_id}.invoke")
         return Decision(DENY, "user lacks a group/role required to invoke this agent", f"agents.{agent_id}.invoke")
 
-    def access_indication(self, p: Principal, agent_id: str) -> dict[str, Any]:
+    def can_approve(self, p: Principal, agent_id: str) -> bool:
+        rule = self.data["agents"].get(agent_id, {}).get("approvers")
+        return bool(rule) and _matches(rule, p)
+
+    def access_indication(self, p: Principal, agent_id: str, has_grant: bool = False) -> dict[str, Any]:
         """What search results may say about an agent. Not a substitute for the invocation check."""
         if not self.visible(p, agent_id):
             return {"visible": False}
         d = self.invocation(p, agent_id)
+        if d.effect == APPROVAL and has_grant:
+            return {"visible": True, "access": "allowed", "reason": "approved for one invocation",
+                    "decision_id": d.decision_id}
         return {"visible": True, "access": ACCESS_LABEL[d.effect], "reason": d.reason, "decision_id": d.decision_id}

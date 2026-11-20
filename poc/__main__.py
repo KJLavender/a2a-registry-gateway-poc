@@ -36,6 +36,12 @@ def main(argv: list[str] | None = None) -> int:
     p_ask.add_argument("prompt")
     p_ask.add_argument("--client", default="orchestrator-runtime")
     p_ask.add_argument("--answer", action="append", default=[], help="reply used if the agent asks for input")
+    p_list = sub.add_parser("approvals", help="list approval requests you can decide (and your own)")
+    p_list.add_argument("--as", dest="user", required=True)
+    p_decide = sub.add_parser("approve", help="approve (or --reject) an approval request")
+    p_decide.add_argument("approval_id")
+    p_decide.add_argument("--as", dest="user", required=True)
+    p_decide.add_argument("--reject", action="store_true")
     p_trace = sub.add_parser("trace", help="show a trace tree (default: latest request)")
     p_trace.add_argument("trace_id", nargs="?")
     args = parser.parse_args(argv)
@@ -92,6 +98,17 @@ def _run(args: argparse.Namespace, settings: Settings, stack) -> None:
         for a in out.artifacts:
             print(f"Artifact《{a['name']}》{a.get('text') or a.get('data')}")
         print(f"\ntrace：python -m poc trace {out.trace_id}")
+    elif args.command in ("approvals", "approve"):
+        import json
+        from poc.common.identity import login
+        from poc.common.web import http
+        headers = {"Authorization": f"Bearer {login(settings, args.user, 'orchestrator-runtime')}"}
+        if args.command == "approvals":
+            status, body, _ = http("GET", f"{settings.pdp_url}/approvals", headers=headers)
+        else:
+            action = "reject" if args.reject else "approve"
+            status, body, _ = http("POST", f"{settings.pdp_url}/approvals/{args.approval_id}/{action}", headers=headers)
+        print(status, json.dumps(body, ensure_ascii=False, indent=2))
     elif args.command == "demo":
         from poc import demo
         demo.run(settings, args.only)
