@@ -33,6 +33,9 @@ class ApprovalStore:
             self._db.execute("""CREATE TABLE IF NOT EXISTS approvals (
                 id TEXT PRIMARY KEY, requester_sub TEXT, requester_name TEXT, agent_id TEXT, status TEXT,
                 created_at REAL, decided_by TEXT, decided_at REAL, consumed_at REAL)""")
+            # At most one pending request per requester and agent, even across processes/connections
+            self._db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_pending ON approvals (requester_sub, agent_id)
+                WHERE status = 'pending'""")
 
     def _rows(self, where: str, args: tuple[Any, ...]) -> list[dict[str, Any]]:
         with self._lock:
@@ -45,15 +48,13 @@ class ApprovalStore:
         return rows[0] if rows else None
 
     def open_or_get(self, requester_sub: str, requester_name: str, agent_id: str) -> dict[str, Any]:
-        pending = self._rows("requester_sub = ? AND agent_id = ? AND status = 'pending'", (requester_sub, agent_id))
-        if pending:
-            return pending[0]
-        approval_id = f"APR-{secrets.token_hex(3).upper()}"
         with self._lock, self._db:
-            self._db.execute("INSERT INTO approvals (id, requester_sub, requester_name, agent_id, status, created_at) "
+            self._db.execute("INSERT OR IGNORE INTO approvals "
+                             "(id, requester_sub, requester_name, agent_id, status, created_at) "
                              "VALUES (?, ?, ?, ?, 'pending', ?)",
-                             (approval_id, requester_sub, requester_name, agent_id, time.time()))
-        return self.get(approval_id) or {}
+                             (f"APR-{secrets.token_hex(3).upper()}", requester_sub, requester_name, agent_id,
+                              time.time()))
+        return self._rows("requester_sub = ? AND agent_id = ? AND status = 'pending'", (requester_sub, agent_id))[0]
 
     def take_grant(self, requester_sub: str, agent_id: str) -> dict[str, Any] | None:
         """Consume one unexpired approval for this requester and agent, if there is one."""
@@ -64,9 +65,22 @@ class ApprovalStore:
                 (requester_sub, agent_id, time.time() - APPROVAL_TTL)).fetchone()
             if row is None:
                 return None
-            self._db.execute("UPDATE approvals SET status = 'consumed', consumed_at = ? WHERE id = ?",
-                             (time.time(), row[0]))
-        return {"id": row[0], "decided_by": row[1]}
+            used = self._db.execute("UPDATE approvals SET status = 'consumed', consumed_at = ? "
+                                    "WHERE id = ? AND status = 'approved'", (time.time(), row[0])).rowcount
+        return {"id": row[0], "decided_by": row[1]} if used else None
+
+    def restore(self, approval_id: str) -> None:
+        """Give an approval back when the call it was used for never reached the agent."""
+        with self._lock, self._db:
+            self._db.execute("UPDATE approvals SET status = 'approved', consumed_at = NULL "
+                             "WHERE id = ? AND status = 'consumed'", (approval_id,))
+
+    def restore_recent(self, requester_sub: str, agent_id: str, within: float = 60) -> None:
+        """Restore the approval this requester used on this agent in the last `within` seconds, if any."""
+        rows = self._rows("requester_sub = ? AND agent_id = ? AND status = 'consumed' AND consumed_at > ?",
+                          (requester_sub, agent_id, time.time() - within))
+        if rows:
+            self.restore(rows[-1]["id"])
 
     def has_grant(self, requester_sub: str, agent_id: str) -> bool:
         return bool(self._rows("requester_sub = ? AND agent_id = ? AND status = 'approved' AND decided_at > ?",
@@ -79,11 +93,12 @@ class ApprovalStore:
             raise ApprovalError(404 if row is None else 403, "approval request not found or not yours to decide")
         if row["requester_sub"] == approver_sub:
             raise ApprovalError(403, "requesters cannot approve their own request")
-        if row["status"] != "pending":
-            raise ApprovalError(409, f"approval request is already {row['status']}")
-        with self._lock, self._db:
-            self._db.execute("UPDATE approvals SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?",
-                             ("approved" if approve else "rejected", approver_name, time.time(), approval_id))
+        with self._lock, self._db:  # the status guard makes the decision atomic across connections
+            changed = self._db.execute(
+                "UPDATE approvals SET status = ?, decided_by = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
+                ("approved" if approve else "rejected", approver_name, time.time(), approval_id)).rowcount
+        if not changed:
+            raise ApprovalError(409, f"approval request is already {(self.get(approval_id) or {}).get('status')}")
         return self.get(approval_id) or {}
 
     def pending(self) -> list[dict[str, Any]]:

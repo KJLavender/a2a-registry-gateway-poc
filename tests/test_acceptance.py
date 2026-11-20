@@ -6,19 +6,22 @@ Where agentgateway behaves differently, the test asserts what it actually does a
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import shutil
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from poc import runtime, traceview
+from poc.agents.base import A2AAgent
 from poc.common.a2a import ROLE_USER, text_message
-from poc.common.identity import login
-from poc.common.web import RpcError, free_port, http
+from poc.common.identity import JwksCache, login
+from poc.common.web import Response, RpcError, free_port, http
 from poc.launcher import Stack, start_stack
-from poc.registry import validate_card
+from poc.registry import Catalog, validate_card
 from poc.runtime import McpClient
 from poc.settings import ROOT, Settings
 
@@ -211,6 +214,45 @@ class Authorization(unittest.TestCase):
         self.assertEqual(result["effect"], "deny")
         self.assertEqual(result["rule"], "delegation.report-analyst")  # both gateways explain the refusal
 
+    def test_approval_is_given_back_when_the_agent_is_down(self):
+        dave = mcp_for("dave")
+        args = {"agent_id": "expense-approver", "message": "3000 元 交通"}
+        result, _ = dave.call_tool("invoke_agent", args)
+        approval_id = result["approval_request_id"]
+        self.assertEqual(http("POST", f"{SETTINGS.pdp_url}/approvals/{approval_id}/approve", headers={
+            "Authorization": f"Bearer {login(SETTINGS, 'carol', 'orchestrator-runtime')}"})[0], 200)
+        real_call = A2AAgent.__call__
+
+        def broken(agent, req):  # the expense agent is down; agentgateway may reuse open connections,
+            if agent.agent_id == "expense-approver":  # so answer 503 instead of closing the socket
+                return Response(503, {"error": "unavailable"})
+            return real_call(agent, req)
+        with mock.patch.object(A2AAgent, "__call__", broken):
+            failed, is_error = dave.call_tool("invoke_agent", args)
+        self.assertTrue(is_error)
+        self.assertNotIn(failed.get("effect"), ("deny", "approval_required"))
+        inv, is_error = dave.call_tool("invoke_agent", args)  # the approval was not used up by the failure
+        self.assertFalse(is_error, inv)
+        self.assertEqual(read_until_done(dave, inv["resource_uri"])["state"], "TASK_STATE_COMPLETED")
+
+    def test_continuing_a_task_is_rechecked(self):
+        carol = mcp_for("carol")
+        inv, _ = carol.call_tool("invoke_agent", {"agent_id": "expense-approver", "message": "申請差旅費報銷"})
+        self.assertEqual(read_until_done(carol, inv["resource_uri"])["state"], "TASK_STATE_INPUT_REQUIRED")
+        policy_path = SETTINGS.config_dir / "policy.json"
+        original = policy_path.read_text(encoding="utf-8")
+        try:
+            policy = json.loads(original)
+            policy["agents"]["expense-approver"]["invoke"] = {"allow_roles": ["nobody"]}  # carol loses access
+            policy_path.write_text(json.dumps(policy), encoding="utf-8")
+            time.sleep(1.5 if AGW else 0.05)
+            result, is_error = carol.call_tool("provide_input", {"task_id": inv["task_id"], "message": "12000 元"})
+            self.assertTrue(is_error)
+            self.assertEqual(result["effect"], "deny")
+        finally:
+            policy_path.write_text(original, encoding="utf-8")
+            time.sleep(1.5 if AGW else 0.05)
+
     def test_origin_header_cannot_be_spoofed(self):
         carol = mcp_for("carol", "report-runtime")
         carol.extra_headers["x-origin-client"] = "orchestrator-runtime"  # pretend to be the orchestrator
@@ -293,7 +335,36 @@ class Observability(unittest.TestCase):
         self.assertNotIn("Bearer", raw)
 
 
+class InputValidation(unittest.TestCase):
+    def test_bad_arguments_are_errors_not_crashes(self):
+        alice = mcp_for("alice")
+        inv, _ = alice.call_tool("invoke_agent", {"agent_id": "it-helpdesk", "message": "VPN"})
+        for wait in ("abc", "nan", "-1"):
+            with self.assertRaises(RpcError) as err:
+                alice.read_resource(f"{inv['resource_uri']}?wait={wait}")
+            self.assertEqual(err.exception.code, -32602)
+        result, is_error = alice.call_tool("search_agents", {"query": "報表", "top_k": "many"})
+        self.assertTrue(is_error)
+        self.assertIn("top_k", result["error"])
+
+
 class Governance(unittest.TestCase):
+    def test_unknown_key_ids_do_not_flood_the_idp(self):
+        cache = JwksCache(SETTINGS.jwks_uri)
+        cache.find("made-up-0")  # first lookup fetches the JWKS
+        with mock.patch("poc.common.identity.http") as fetch:
+            for i in range(20):
+                self.assertIsNone(cache.find(f"made-up-{i}"))
+            fetch.assert_not_called()
+
+    def test_unreachable_agent_does_not_break_the_catalog(self):
+        settings = dataclasses.replace(SETTINGS, agent_ports={**SETTINGS.agent_ports, "it-helpdesk": free_port()})
+        catalog = Catalog(settings)
+        catalog.sync()
+        self.assertIn("unreachable", catalog.rejected["it-helpdesk"][0])
+        self.assertEqual(len(catalog.cards), 3)
+        self.assertEqual(validate_card({"name": "x", "description": "y", "skills": "oops"})[-1], "skills is not a list")
+
     def test_invalid_cards_are_rejected(self):
         self.assertIn("missing skills", validate_card({"name": "x", "description": "y"}))
         self.assertEqual(STACK.registry.catalog.rejected, {})

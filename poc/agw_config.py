@@ -11,6 +11,7 @@ agents check it.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from poc.settings import Settings
@@ -116,6 +117,10 @@ def build(settings: Settings) -> dict[str, Any]:
 def write(settings: Settings) -> str:
     path = settings.var_dir / "agentgateway.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
-    # JSON is valid YAML; agentgateway reads it as-is
-    path.write_text(json.dumps(build(settings), indent=2, ensure_ascii=False), encoding="utf-8")
+    # JSON is valid YAML; agentgateway reads it as-is. Build first, then swap the file in one step so
+    # agentgateway never reloads a half-written config.
+    text = json.dumps(build(settings), indent=2, ensure_ascii=False)
+    tmp = path.with_suffix(".yaml.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
     return str(path)

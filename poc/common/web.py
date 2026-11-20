@@ -164,7 +164,7 @@ def rpc_call(url: str, method: str, params: dict[str, Any], *, headers: dict[str
              timeout: float = 30.0) -> Any:
     payload = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method, "params": params}
     status, body, _ = http("POST", url, json_body=payload, headers=headers, timeout=timeout)
-    if isinstance(body, dict) and "error" in body:
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):  # a JSON-RPC error, not a plain HTTP one
         e = body["error"]
         raise RpcError(e.get("code", -32603), e.get("message", ""), e.get("data"), http_status=status)
     if status != 200 or not isinstance(body, dict) or "result" not in body:

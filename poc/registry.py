@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import logging
 import sqlite3
 import threading
@@ -107,8 +108,16 @@ def validate_card(card: Any) -> list[str]:
     if not isinstance(card, dict):
         return ["card is not a JSON object"]
     problems = [f"missing {f}" for f in REQUIRED_CARD_FIELDS if not card.get(f)]
-    for i, skill in enumerate(card.get("skills") or []):
+    skills = card.get("skills")
+    if skills and not isinstance(skills, list):
+        return problems + ["skills is not a list"]
+    for i, skill in enumerate(skills or []):
+        if not isinstance(skill, dict):
+            problems.append(f"skills[{i}] is not an object")
+            continue
         problems += [f"skills[{i}] missing {f}" for f in REQUIRED_SKILL_FIELDS if not skill.get(f)]
+        if not isinstance(skill.get("tags", []), list):
+            problems.append(f"skills[{i}].tags is not a list")
     return problems
 
 
@@ -152,19 +161,38 @@ class Catalog:
         self.cards: dict[str, dict[str, Any]] = {}
         self.rejected: dict[str, list[str]] = {}
         self.index = AgentIndex()
+        self._synced_at = 0.0
+        self._lock = threading.Lock()
+
+    RETRY_INTERVAL = 30.0
 
     def sync(self) -> None:
-        """Pull cards only from governed entries; invalid cards are rejected, not indexed."""
-        for agent_id in self.entries:
+        """Pull cards only from active governed entries; unreachable or invalid ones are not indexed."""
+        cards: dict[str, dict[str, Any]] = {}
+        rejected: dict[str, list[str]] = {}
+        index = AgentIndex()
+        for agent_id, entry in self.entries.items():
+            if entry.get("lifecycle", "active") != "active":
+                continue
             url = f"{self.settings.agent_url(agent_id)}/.well-known/agent-card.json"
-            status, card, _ = http("GET", url, timeout=5)
-            problems = [f"HTTP {status}"] if status != 200 else validate_card(card)
+            try:
+                status, card, _ = http("GET", url, timeout=5)
+                problems = [f"HTTP {status}"] if status != 200 else validate_card(card)
+            except OSError as e:
+                problems = [f"unreachable: {e}"]
             if problems:
-                self.rejected[agent_id] = problems
+                rejected[agent_id] = problems
                 log.warning("agent card for %s rejected: %s", agent_id, problems)
                 continue
-            self.cards[agent_id] = card
-            self.index.add(agent_id, card)
+            cards[agent_id] = card
+            index.add(agent_id, card)
+        with self._lock:
+            self.cards, self.rejected, self.index, self._synced_at = cards, rejected, index, time.time()
+
+    def refresh_if_needed(self) -> None:
+        """Retry agents that were unreachable or invalid, at most every RETRY_INTERVAL seconds."""
+        if self.rejected and time.time() - self._synced_at > self.RETRY_INTERVAL:
+            self.sync()
 
     def a2a_endpoint(self, agent_id: str) -> str:
         return f"{self.settings.gateway_url}/agents/{agent_id}/a2a"
@@ -177,8 +205,16 @@ def parse_task_uri(uri: str) -> tuple[str, str, float | None]:
     parts = urlsplit(uri)
     if not uri.startswith(URI_SCHEME) or not parts.netloc or not parts.path.strip("/"):
         raise RpcError(RESOURCE_NOT_FOUND, "Resource not found", {"uri": uri})
-    wait = parse_qs(parts.query).get("wait")
-    return parts.netloc, parts.path.strip("/"), float(wait[0]) if wait else None
+    raw = parse_qs(parts.query).get("wait")
+    wait = None
+    if raw:
+        try:
+            wait = float(raw[0])
+        except ValueError:
+            wait = math.nan
+        if not math.isfinite(wait) or wait < 0:
+            raise RpcError(-32602, "wait must be a non-negative number of seconds", {"uri": uri})
+    return parts.netloc, parts.path.strip("/"), wait
 
 
 def task_view(agent_id: str, task: dict[str, Any]) -> dict[str, Any]:
@@ -290,7 +326,11 @@ class AgentRegistry(McpServer):
 
     def _search(self, args: dict[str, Any], ctx: McpContext, sp: trace.Span) -> dict[str, Any]:
         query = str(args.get("query", "")).strip()
-        top_k = max(1, min(int(args.get("top_k", 5)), 10))
+        try:
+            top_k = max(1, min(int(args.get("top_k", 5)), 10))
+        except (TypeError, ValueError):
+            raise RpcError(-32602, "top_k must be an integer between 1 and 10")
+        self.catalog.refresh_if_needed()
         hits = self.catalog.index.search(query, top_k * 2)
         access = self._access([h[0] for h in hits], ctx, sp) if hits else {}
         matches = []
@@ -342,7 +382,12 @@ class AgentRegistry(McpServer):
             if e.http_status == 403 and e.code != POLICY_DENIED:  # a gateway without JSON-RPC error bodies
                 raise RpcError(POLICY_DENIED, "Request refused by Agent Gateway policy",
                                {"effect": "deny", "gateway_response": e.data}) from e
+            if e.code != POLICY_DENIED:
+                self._restore_approval(agent_id, ctx, sp)
             raise
+        except (OSError, TokenError):
+            self._restore_approval(agent_id, ctx, sp)
+            raise RpcError(-32603, f"agent {agent_id!r} is unavailable") from None
         task = result["task"]
         state = task["status"]["state"]
         self.tasks.add(task["id"], agent_id, ctx.principal.sub, task.get("contextId", ""), sp.trace_id, state)
@@ -352,6 +397,17 @@ class AgentRegistry(McpServer):
             "state": state, "resource_uri": f"{URI_SCHEME}{agent_id}/{task['id']}",
             "next_action": "Read resource_uri to wait for progress and results.",
         })
+
+    def _restore_approval(self, agent_id: str, ctx: McpContext, sp: trace.Span) -> None:
+        """agentgateway's PDP uses up an approval when it allows the call; give it back if the call failed.
+        (The built-in gateway does this itself.)"""
+        if self.settings.gateway_impl != "agentgateway":
+            return
+        try:
+            http("POST", f"{self.settings.pdp_url}/approvals/restore", json_body={"agent_id": agent_id},
+                 headers=self._gateway_headers(ctx, sp))
+        except (OSError, TokenError) as e:
+            log.warning("could not restore approval for %s: %s", agent_id, e)
 
     def _owned(self, task_id: str, ctx: McpContext) -> dict[str, Any]:
         row = self.tasks.get(task_id)

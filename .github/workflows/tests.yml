@@ -15,6 +15,7 @@ jobs:
   mock-idp:
     name: mock IdP / ${{ matrix.gateway }} / py${{ matrix.python }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -38,6 +39,7 @@ jobs:
   keycloak:
     name: Keycloak / ${{ matrix.gateway }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

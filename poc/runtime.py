@@ -57,7 +57,7 @@ class McpClient:
         status, body, headers = self._post({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, timeout)
         if isinstance(body, str) and headers.get("content-type", "").startswith("text/event-stream"):
             body = _from_sse(body, rid)
-        if isinstance(body, dict) and "error" in body:
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
             err = body["error"]
             raise RpcError(err.get("code", -32603), err.get("message", ""), err.get("data"), http_status=status)
         if status != 200 or not isinstance(body, dict):
@@ -166,6 +166,10 @@ def ask(settings: Settings, user: str, prompt: str, *, client: str = "orchestrat
                     last_message = view["status_message"]
                 if view["terminal"]:
                     break
+                if view["state"] not in (INPUT_REQUIRED, "TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"):
+                    # e.g. AUTH_REQUIRED: this runtime cannot grant it, so hand it back instead of re-reading
+                    return Outcome(view["state"].removeprefix("TASK_STATE_").lower(), root.trace_id,
+                                   chosen["agent_id"], task_id, view["status_message"], matches=matches)
                 if view["state"] == INPUT_REQUIRED:
                     if not answers:
                         return Outcome("input_required", root.trace_id, chosen["agent_id"], task_id,

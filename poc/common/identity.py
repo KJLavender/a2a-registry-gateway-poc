@@ -20,19 +20,32 @@ Verifier = Callable[[str, str], dict[str, Any]]
 
 
 class JwksCache:
-    """Fetches the IdP's JWKS on demand and again when an unknown key id shows up."""
+    """Fetches the IdP's JWKS on demand. An unknown key id triggers a refetch at most every
+    REFETCH_INTERVAL seconds, so tokens with made-up `kid`s cannot flood the IdP."""
+
+    REFETCH_INTERVAL = 30.0
 
     def __init__(self, jwks_uri: str):
         self.jwks_uri = jwks_uri
         self._keys: dict[str, dict[str, Any]] = {}
+        self._fetched_at = 0.0
         self._lock = threading.Lock()
 
     def find(self, kid: str) -> dict[str, Any] | None:
         with self._lock:
-            if kid not in self._keys:
-                status, body, _ = http("GET", self.jwks_uri, timeout=5)
-                if status == 200:
-                    self._keys = {k["kid"]: k for k in body.get("keys", [])}
+            if kid in self._keys:
+                return self._keys[kid]
+            if self._keys and time.time() - self._fetched_at < self.REFETCH_INTERVAL:
+                return None
+            self._fetched_at = time.time()
+        try:
+            status, body, _ = http("GET", self.jwks_uri, timeout=5)
+        except OSError as e:
+            raise TokenError(f"signing keys unavailable: {e}") from e
+        if status != 200 or not isinstance(body, dict):
+            raise TokenError(f"signing keys unavailable (HTTP {status})")
+        with self._lock:
+            self._keys = {k["kid"]: k for k in body.get("keys", []) if "kid" in k}
             return self._keys.get(kid)
 
 
@@ -114,7 +127,10 @@ class TokenExchanger:
         if status != 200:
             raise TokenError(f"token exchange to {audience} failed: {body}")
         token = body["access_token"]
+        now = time.time()
         with self._lock:
+            for stale in [k for k, (_, exp) in self._cache.items() if exp <= now]:
+                del self._cache[stale]
             self._cache[key] = (token, jwt.unverified_claims(token)["exp"])
         return token
 

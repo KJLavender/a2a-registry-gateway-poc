@@ -83,6 +83,8 @@ class McpServer:
                 raise RpcError(-32601, f"Method not found: {method}")
         except RpcError as e:
             return rpc_response(rid, error=e)
+        except (ValueError, TypeError) as e:
+            return rpc_response(rid, error=RpcError(-32602, f"Invalid params: {e}"))
         return rpc_response(rid, result)
 
 

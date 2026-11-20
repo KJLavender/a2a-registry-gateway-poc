@@ -9,7 +9,8 @@ Routes
 Policies enforced here
   1. tools/list   : capability distribution by runtime (workload) identity (tools come from the registry)
   2. tools/call   : tool authorization by user claims
-  3. A2A invoke   : delegation policy (caller agent -> target) + user authorization, re-checked on every call
+  3. A2A invoke   : delegation policy (caller agent -> target) + user authorization, checked on every new
+                    task and again when a task is continued
   4. task access  : GetTask / CancelTask / resources/read only for the task owner
 """
 from __future__ import annotations
@@ -25,7 +26,7 @@ from poc.common.identity import Principal, TokenExchanger, Verifier
 from poc.common.jwt import TokenError
 from poc.common.mcp import RESOURCE_NOT_FOUND, McpContext, McpServer, serve_mcp, tool_result
 from poc.common.web import Request, Response, RpcError, http, rpc_call, rpc_response
-from poc.pdp import A2AAuthorizer, refusal
+from poc.pdp import A2AAuthorizer, is_continuation, is_new_task, refusal
 from poc.policy import PolicyStore
 from poc.registry import parse_task_uri
 from poc.settings import Settings
@@ -175,33 +176,40 @@ class AgentGateway:
             return p
         with trace.span(f"gateway a2a {method}", COMPONENT, req.headers.get("traceparent"), agent_id=agent_id,
                         user=p.username, delegation_path=" > ".join(p.actors)) as sp:
-            new_task = method == "SendMessage" and not (params.get("message") or {}).get("taskId")
+            new_task = is_new_task(msg)
             if not self.policy.visible(p, agent_id):
                 sp.set(policy_effect="deny", reason="agent hidden from user")
                 return Response(404, {"error": "not found"})  # identical to a path with no agent
-            if new_task:
-                decision = self.authorizer.new_task(p, agent_id)
+            grant_id = None
+            if new_task or is_continuation(msg):
+                decision = (self.authorizer.new_task if new_task else self.authorizer.continuation)(p, agent_id)
                 sp.set(policy_effect=decision.effect, policy_rule=decision.rule, decision_id=decision.decision_id,
                        approval_request_id=decision.approval_request_id)
                 if not decision.allowed:
                     return refusal(rid, decision)
-            elif method in ("SendMessage", "GetTask", "CancelTask"):
+                grant_id = decision.approval_request_id if new_task else None
+            if not new_task and method in ("SendMessage", "GetTask", "CancelTask"):
                 task_id = params.get("id") if method != "SendMessage" else params["message"]["taskId"]
                 if not self.owns(p, agent_id, task_id):
                     sp.set(policy_effect="deny", reason="not task owner")
                     return Response(200, rpc_response(rid, error=RpcError(TASK_NOT_FOUND, "task not found")))
-            agent_token = self.exchanger.exchange(req.bearer or "", f"agent:{agent_id}", p.origin_scope)
-            headers = {"Authorization": f"Bearer {agent_token}", "traceparent": sp.traceparent}
-            if req.headers.get("a2a-version"):
-                headers["A2A-Version"] = req.headers["a2a-version"]
-            status, body, _ = http("POST", f"{self.settings.agent_url(agent_id)}/a2a", json_body=msg,
-                                   headers=headers, timeout=90)
+            try:
+                agent_token = self.exchanger.exchange(req.bearer or "", f"agent:{agent_id}", p.origin_scope)
+                headers = {"Authorization": f"Bearer {agent_token}", "traceparent": sp.traceparent}
+                if req.headers.get("a2a-version"):
+                    headers["A2A-Version"] = req.headers["a2a-version"]
+                status, body, _ = http("POST", f"{self.settings.agent_url(agent_id)}/a2a", json_body=msg,
+                                       headers=headers, timeout=90)
+            except (OSError, TokenError) as e:
+                status, body = 502, rpc_response(rid, error=RpcError(-32603, f"agent unavailable: {e}"))
             task = (body or {}).get("result", {}) if isinstance(body, dict) else {}
-            task = task.get("task", task)
-            if new_task and isinstance(task, dict) and task.get("id"):
+            task = task.get("task", task) if isinstance(task, dict) else {}
+            if grant_id and not task.get("id"):
+                self.approvals.restore(grant_id)  # the call never created a task: give the approval back
+            if new_task and task.get("id"):
                 with self._lock:
                     self._task_owner[task["id"]] = (agent_id, p.sub)
-            if isinstance(task, dict) and task.get("status"):
+            if task.get("status"):
                 sp.set(task_id=task.get("id"), state=task["status"]["state"])
             return Response(status, body)
 

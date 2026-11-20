@@ -30,15 +30,39 @@ _DECIDE_PATH = re.compile(r"^/approvals/(APR-[0-9A-F]+)/(approve|reject)$")
 NOT_FOUND = Response(404, "route not found", {"Content-Type": "text/plain"})
 
 
+def is_new_task(rpc: Any) -> bool:
+    """A2A SendMessage without a taskId starts a new task; with one it continues an existing task."""
+    if not isinstance(rpc, dict) or rpc.get("method") != "SendMessage":
+        return False
+    params = rpc.get("params")
+    message = params.get("message") if isinstance(params, dict) else None
+    return not (isinstance(message, dict) and message.get("taskId"))
+
+
+def is_continuation(rpc: Any) -> bool:
+    return isinstance(rpc, dict) and rpc.get("method") == "SendMessage" and not is_new_task(rpc)
+
+
 class A2AAuthorizer:
+    """A2A rules shared by both gateways. Callers check visibility first (hidden = 404).
+
+    - New task: the full invocation decision, every time (approvals included).
+    - Continuing a task (provide_input): refused if the user may no longer invoke the agent at all;
+      an approval-gated user may continue the task that was approved.
+    - GetTask / CancelTask: allowed here; the agent only serves the task's owner.
+    """
+
     def __init__(self, policy: PolicyStore, approvals: ApprovalStore):
         self.policy = policy
         self.approvals = approvals
 
-    def new_task(self, p: Principal, agent_id: str) -> Decision | None:
-        """None means the agent is hidden from this user (answer as if it does not exist)."""
-        if not self.policy.visible(p, agent_id):
-            return None
+    def continuation(self, p: Principal, agent_id: str) -> Decision:
+        decision = self.policy.invocation(p, agent_id)
+        if decision.effect == APPROVAL:
+            return Decision(ALLOW, "continuing a task the user was allowed to start", decision.rule)
+        return decision
+
+    def new_task(self, p: Principal, agent_id: str) -> Decision:
         decision = self.policy.invocation(p, agent_id)  # authoritative, every time
         if decision.effect == APPROVAL:
             grant = self.approvals.take_grant(p.sub, agent_id)
@@ -65,6 +89,8 @@ class PolicyDecisionPoint:
     def __call__(self, req: Request) -> Response:
         if req.path == "/authz/a2a":  # agentgateway keeps the original method (GET for agent cards)
             return self._authz(req)
+        if req.method == "POST" and req.path == "/approvals/restore":
+            return self._restore(req)
         if req.method == "GET" and req.path == "/approvals":
             return self._list(req)
         m = _DECIDE_PATH.match(req.path)
@@ -93,21 +119,34 @@ class PolicyDecisionPoint:
             rpc = json.loads(req.body or b"{}")
         except ValueError:
             rpc = {}
-        method = rpc.get("method")
-        new_task = method == "SendMessage" and not ((rpc.get("params") or {}).get("message") or {}).get("taskId")
+        method = rpc.get("method") if isinstance(rpc, dict) else None
         with trace.span(f"pdp authz {method}", COMPONENT, req.headers.get("traceparent"),
                         agent_id=agent_id, user=p.username) as sp:
             if not self.policy.visible(p, agent_id):
                 sp.set(policy_effect="deny", reason="agent hidden from user")
                 return NOT_FOUND
-            if not new_task:
-                return Response(200, {"allow": True})  # task access is checked by the agent (owner only)
-            decision = self.authorizer.new_task(p, agent_id)
+            if is_new_task(rpc):
+                decision = self.authorizer.new_task(p, agent_id)
+            elif is_continuation(rpc):
+                decision = self.authorizer.continuation(p, agent_id)
+            else:
+                return Response(200, {"allow": True})  # GetTask/CancelTask: the agent serves the owner only
             sp.set(policy_effect=decision.effect, policy_rule=decision.rule, decision_id=decision.decision_id,
                    approval_request_id=decision.approval_request_id)
             if decision.allowed:
                 return Response(200, {"allow": True})
             return refusal(rpc.get("id"), decision)
+
+    def _restore(self, req: Request) -> Response:
+        """Called by the registry when a call allowed by an approval failed before reaching the agent."""
+        p = self._principal(req.bearer or "")
+        if isinstance(p, Response):
+            return p
+        if p.immediate_actor != "agent-registry":
+            return Response(403, {"error": "only the agent registry may restore approvals"})
+        agent_id = str(req.json().get("agent_id", ""))
+        self.approvals.restore_recent(p.sub, agent_id)
+        return Response(200, {"restored_for": agent_id})
 
     def _list(self, req: Request) -> Response:
         p = self._principal(req.bearer or "")
