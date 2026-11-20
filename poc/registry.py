@@ -32,7 +32,7 @@ from poc.common.mcp import RESOURCE_NOT_FOUND, McpContext, McpServer, serve_mcp,
 from poc.common.web import Request, Response, RpcError, http, rpc_call
 from poc.approvals import ApprovalStore
 from poc.policy import PolicyStore
-from poc.search import AgentIndex
+from poc.search import make_index
 from poc.settings import Settings
 from poc.txn import HEADER as TXN_HEADER, TxnVerifier
 
@@ -161,7 +161,7 @@ class Catalog:
         self.entries = {e["agent_id"]: e for e in settings.load("agents.json")["agents"]}
         self.cards: dict[str, dict[str, Any]] = {}
         self.rejected: dict[str, list[str]] = {}
-        self.index = AgentIndex()
+        self.index = make_index(settings)
         self._synced_at = 0.0
         self._lock = threading.Lock()
 
@@ -171,7 +171,7 @@ class Catalog:
         """Pull cards only from active governed entries; unreachable or invalid ones are not indexed."""
         cards: dict[str, dict[str, Any]] = {}
         rejected: dict[str, list[str]] = {}
-        index = AgentIndex()
+        index = make_index(self.settings)
         for agent_id, entry in self.entries.items():
             if entry.get("lifecycle", "active") != "active":
                 continue
@@ -187,6 +187,7 @@ class Catalog:
                 continue
             cards[agent_id] = card
             index.add(agent_id, card)
+        index.prepare()
         with self._lock:
             self.cards, self.rejected, self.index, self._synced_at = cards, rejected, index, time.time()
 
@@ -356,7 +357,7 @@ class AgentRegistry(McpServer):
             result, note = "matches_without_access", "有相關的 Agent，但目前使用者沒有直接調用的權限。"
         sp.set(query_chars=len(query), result=result, matches=",".join(m["agent_id"] for m in matches))
         return tool_result({"result": result, "note": note, "matches": matches,
-                            "search_mode": "keyword-bm25"})
+                            "search_mode": self.catalog.index.mode})
 
     def _invoke(self, args: dict[str, Any], ctx: McpContext, sp: trace.Span) -> dict[str, Any]:
         agent_id = str(args.get("agent_id", ""))

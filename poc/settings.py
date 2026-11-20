@@ -41,6 +41,8 @@ class Settings:
     otlp_endpoint: str = field(default_factory=lambda: os.environ.get("POC_OTLP_ENDPOINT", ""))
     # Where approval notifications are POSTed (Slack/Mattermost incoming webhook); empty = inbox only
     approval_webhook: str = field(default_factory=lambda: os.environ.get("POC_APPROVAL_WEBHOOK", ""))
+    # Agent search: "auto" = keyword + embeddings when fastembed is installed, else keyword only
+    search_mode: str = field(default_factory=lambda: os.environ.get("POC_SEARCH", "auto"))
     # Upper bound for one blocking Task Resource read; must stay below MCP client timeouts.
     resource_wait_seconds: float = field(default_factory=lambda: float(os.environ.get("POC_RESOURCE_WAIT", "20")))
 

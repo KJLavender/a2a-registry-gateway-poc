@@ -14,3 +14,4 @@ plan.md
 *_plan.md
 plans/
 .venv/
+.cache/

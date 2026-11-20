@@ -153,6 +153,21 @@ class Discovery(unittest.TestCase):
         self.assertEqual(denied["result"], "matches_without_access")
         self.assertEqual(denied["matches"][0]["access"], "denied")
 
+    def test_semantic_search_finds_paraphrases(self):
+        alice = mcp_for("alice")
+        vpn, _ = alice.call_tool("search_agents", {"query": "從家裡沒辦法連上公司內網"})
+        if vpn["search_mode"] != "hybrid-bm25-embedding":
+            self.skipTest("semantic search needs fastembed (pip install fastembed)")
+        self.assertEqual(vpn["matches"][0]["agent_id"], "it-helpdesk")
+        self.assertEqual(vpn["matches"][0]["matched_terms"], [])  # no shared keywords: found by meaning
+        taxi, _ = alice.call_tool("search_agents", {"query": "上週出差的計程車錢要怎麼拿回來"})
+        self.assertEqual(taxi["matches"][0]["agent_id"], "expense-approver")
+        room, _ = alice.call_tool("search_agents", {"query": "幫我訂明天下午的會議室"})
+        self.assertEqual(room["result"], "no_matching_agent")
+        bob = mcp_for("bob")
+        forensics, _ = bob.call_tool("search_agents", {"query": "有人半夜用我的帳號登入，幫我查入侵的時間軸"})
+        self.assertNotIn("security-forensics", [m["agent_id"] for m in forensics["matches"]])  # still hidden
+
     def test_search_indication_does_not_replace_invocation_check(self):
         alice = mcp_for("alice")
         found, _ = alice.call_tool("search_agents", {"query": "晨會報表"})
