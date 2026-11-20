@@ -1,0 +1,71 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  AGENTGATEWAY_VERSION: v1.7.0
+
+jobs:
+  mock-idp:
+    name: mock IdP / ${{ matrix.gateway }} / py${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+        gateway: [builtin, agentgateway]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Download agentgateway
+        if: matrix.gateway == 'agentgateway'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/get-agentgateway.sh
+      - name: Run tests
+        env:
+          POC_GATEWAY: ${{ matrix.gateway }}
+        run: python -m unittest -v
+
+  keycloak:
+    name: Keycloak / ${{ matrix.gateway }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        gateway: [builtin, agentgateway]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Start Keycloak
+        run: |
+          docker compose -f keycloak/docker-compose.yml up -d
+          for i in $(seq 1 90); do
+            curl -fs http://127.0.0.1:18080/realms/poc/.well-known/openid-configuration > /dev/null && exit 0
+            sleep 2
+          done
+          docker compose -f keycloak/docker-compose.yml logs
+          exit 1
+      - name: Download agentgateway
+        if: matrix.gateway == 'agentgateway'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/get-agentgateway.sh
+      - name: Run tests (includes Keycloak delegation tests)
+        env:
+          POC_IDP: keycloak
+          POC_GATEWAY: ${{ matrix.gateway }}
+        run: python -m unittest -v
+      - name: Keycloak logs on failure
+        if: failure()
+        run: docker compose -f keycloak/docker-compose.yml logs --tail 200

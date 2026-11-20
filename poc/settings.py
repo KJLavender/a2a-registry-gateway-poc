@@ -3,11 +3,19 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
+# Release asset name of the agentgateway binary for this machine (see README for the download command)
+_AGENTGATEWAY_ASSET = {
+    ("Windows", "AMD64"): "agentgateway-windows-amd64.exe",
+    ("Linux", "x86_64"): "agentgateway-linux-amd64",
+    ("Linux", "aarch64"): "agentgateway-linux-arm64",
+    ("Darwin", "arm64"): "agentgateway-darwin-arm64",
+}.get((platform.system(), platform.machine()), "agentgateway")
 
 
 @dataclass
@@ -25,7 +33,7 @@ class Settings:
     # "builtin" = poc/gateway.py; "agentgateway" = the agentgateway binary configured from policy.json
     gateway_impl: str = field(default_factory=lambda: os.environ.get("POC_GATEWAY", "builtin"))
     agentgateway_bin: Path = field(default_factory=lambda: Path(os.environ.get(
-        "POC_AGENTGATEWAY_BIN", ROOT / "bin" / "agentgateway-windows-amd64.exe")))
+        "POC_AGENTGATEWAY_BIN", ROOT / "bin" / _AGENTGATEWAY_ASSET)))
     # Multiplier for simulated agent work time (tests use a smaller value).
     speed: float = field(default_factory=lambda: float(os.environ.get("POC_SPEED", "1.0")))
     # Upper bound for one blocking Task Resource read; must stay below MCP client timeouts.
