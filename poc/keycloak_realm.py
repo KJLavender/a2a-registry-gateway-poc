@@ -15,6 +15,9 @@ from poc.settings import ROOT, Settings
 
 DEV_PASSWORD = "dev-password"
 TOKEN_LIFESPAN = 8 * 3600
+# Client a user signs in with when they consent to "agent-gateway may act for me" (delegation preview).
+DELEGATING_CLIENT = "orchestrator-delegated"
+DELEGATION_REDIRECT = "http://127.0.0.1:18999/callback"  # never served; the login helper reads the code from it
 
 
 def _mapper(name: str, kind: str, **config: str) -> dict[str, Any]:
@@ -38,10 +41,31 @@ CLAIM_MAPPERS = [
 ]
 
 
-def _service_client(client_id: str, secret: str, audiences: list[str], origin_scopes: list[str]) -> dict[str, Any]:
+# Same as the scope Keycloak creates when token-exchange-delegation is on. Listed here because a realm
+# import with its own clientScopes does not get the built-in ones.
+DELEGATION_CLIENT_SCOPE = {
+    "name": "delegation:client", "protocol": "openid-connect",
+    "description": "OpenID Connect scope for agent/client token exchange delegation",
+    "attributes": {"include.in.token.scope": "true", "parameterized.scope.type": "client-delegation",
+                   "display.on.consent.screen": "true", "always.display.consent": "true",
+                   "is.parameterized.scope": "true", "consent.screen.text": "${clientDelegationScopeConsentText}"},
+    "protocolMappers": [
+        _mapper("client may_act client_id", "oidc-parameterized-scope-mapper",
+                **{"claim.name": "may_act.client_id", "jsonType.label": "String"}),
+        {"name": "client delegation audience", "protocol": "openid-connect",
+         "protocolMapper": "oidc-parameterized-scope-audience-mapper",
+         "config": {"access.token.claim": "true", "introspection.token.claim": "true"}},
+        _mapper("client may_act sub", "oidc-parameterized-scope-client-sub-mapper",
+                **{"claim.name": "may_act.sub", "jsonType.label": "String"}),
+    ],
+}
+
+
+def _service_client(client_id: str, secret: str, audiences: list[str], origin_scopes: list[str],
+                    service_account: bool = False) -> dict[str, Any]:
     return {
         "clientId": client_id, "enabled": True, "publicClient": False, "secret": secret,
-        "standardFlowEnabled": False, "directAccessGrantsEnabled": False, "serviceAccountsEnabled": False,
+        "standardFlowEnabled": False, "directAccessGrantsEnabled": False, "serviceAccountsEnabled": service_account,
         "attributes": {"standard.token.exchange.enabled": "true"},
         "fullScopeAllowed": True,
         "defaultClientScopes": ["poc-claims"], "optionalClientScopes": origin_scopes,
@@ -69,7 +93,8 @@ def build(settings: Settings) -> dict[str, Any]:
         })
 
     client_scopes = [{"name": "poc-claims", "protocol": "openid-connect",
-                      "attributes": {"include.in.token.scope": "false"}, "protocolMappers": CLAIM_MAPPERS}]
+                      "attributes": {"include.in.token.scope": "false"}, "protocolMappers": CLAIM_MAPPERS},
+                     DELEGATION_CLIENT_SCOPE]
     for runtime in runtimes:
         client_scopes.append({
             "name": f"origin-{runtime}", "protocol": "openid-connect",
@@ -88,9 +113,19 @@ def build(settings: Settings) -> dict[str, Any]:
             "protocolMappers": [_audience("agent-gateway")],
         })
     secrets = {c: v["secret"] for c, v in directory["clients"].items() if v.get("type") == "service"}
+    # agent-gateway gets a service account: it is the actor in delegated exchanges
     clients.append(_service_client("agent-gateway", secrets["agent-gateway"], ["agent-registry", *agent_clients],
-                                   origin_scopes))
-    clients.append(_service_client("agent-registry", secrets["agent-registry"], ["agent-gateway"], origin_scopes))
+                                   origin_scopes, service_account=True))
+    clients.append({  # delegation needs a consent screen, so this one uses the browser login flow
+        "clientId": DELEGATING_CLIENT, "enabled": True, "publicClient": True, "consentRequired": True,
+        "standardFlowEnabled": True, "directAccessGrantsEnabled": False,
+        "redirectUris": [DELEGATION_REDIRECT], "fullScopeAllowed": True,
+        "defaultClientScopes": ["poc-claims", "origin-orchestrator-runtime"],
+        "optionalClientScopes": ["delegation:client"],
+        "protocolMappers": [_audience("agent-gateway")],
+    })
+    clients.append(_service_client("agent-registry", secrets["agent-registry"], ["agent-gateway"], origin_scopes,
+                                   service_account=True))  # only used to show a wrong actor is refused
     for client_id in agent_clients:  # audiences only; they never request tokens
         clients.append({"clientId": client_id, "enabled": True, "publicClient": False,
                         "standardFlowEnabled": False, "directAccessGrantsEnabled": False,
@@ -98,6 +133,7 @@ def build(settings: Settings) -> dict[str, Any]:
 
     return {
         "realm": "poc", "enabled": True,
+        "adminPermissionsEnabled": True,  # FGAP v2, where delegation permissions live
         "accessTokenLifespan": TOKEN_LIFESPAN, "ssoSessionIdleTimeout": TOKEN_LIFESPAN,
         "ssoSessionMaxLifespan": TOKEN_LIFESPAN + 3600,
         "groups": [{"name": g} for g in groups],

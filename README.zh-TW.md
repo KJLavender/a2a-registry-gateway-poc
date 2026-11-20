@@ -34,8 +34,10 @@ Keycloak :18080  選用，真的 Keycloak（keycloak/docker-compose.yml）
 | `poc/agents/` | A2A 1.0 server 和四個示範 Agent（IT 服務台、晨會報表分析、費用簽核、隱藏的資安鑑識） |
 | `poc/idp.py` + `config/users.json` | 假的使用者、群組、角色，以及 token exchange 規則 |
 | `poc/keycloak_realm.py` + `keycloak/` | 用同一份設定產生的 Keycloak realm，以及啟動它的 compose 檔 |
+| `poc/pdp.py` + `poc/approvals.py` | A2A 呼叫的政策決策服務（兩種 Gateway 共用）和核准申請 |
+| `poc/keycloak_delegation.py` | Keycloak 委派的設定，以及委派測試用的瀏覽器式登入 |
 | `poc/common/trace.py` | 每一段都帶著 W3C trace context，寫到 `var/traces.jsonl` |
-| `tests/test_acceptance.py` | 20 個驗收測試：搜尋、授權、非同步 Task、trace |
+| `tests/` | 20 個驗收測試（搜尋、授權、核准、非同步 Task、trace）和 6 個 Keycloak 委派測試 |
 
 所有 Agent 的資料都是模擬的，不會碰到任何真實系統。
 
@@ -53,7 +55,7 @@ demo 會看到：
 3. bob 問同一件事。Agent 找得到，但標示為 `denied`，他會知道公司其實有這個能力。
 4. bob 問天氣。沒有符合的 Agent，這和「沒有權限」是分開回報的。
 5. carol 申請費用沒寫金額。Task 進入 `INPUT_REQUIRED`，她補上金額後完成。
-6. dave 在財務部但沒有簽核角色。Gateway 回 `approval_required` 和一個核准申請編號。
+6. dave 在財務部但沒有簽核角色。Gateway 回 `approval_required` 和一個核准申請編號；carol 核准後 dave 再試就會通過，再下一次又需要新的核准。
 7. 資安鑑識 Agent 是隱藏的。bob 搜不到也叫不到；erin（SecOps）可以用。
 8. 同一個使用者改從另一個 runtime（報表 Agent 的）發出，會被委派政策擋下。
 9. `cancel_task` 會取消 Task；讀取逾時則不會。
@@ -103,22 +105,32 @@ launcher 會根據 `config/policy.json` 產生 `var/agentgateway.yaml`，再啟�
 政策怎麼對應過去：
 
 - 工具分發和工具呼叫變成 `mcpAuthorization` 的 CEL 規則。agentgateway 會把呼叫者不能用的工具從 `tools/list` 拿掉，所以一組規則就涵蓋兩件事。
-- 每個 Agent 有一條 A2A route，用 `authorization` 的 CEL 規則檢查：看不看得到、委派政策（從 token 的 `act` 鏈最底層讀出是哪個 runtime）、使用者的群組或角色。
+- 每個 Agent 有一條 A2A route，由政策決策服務（`poc/pdp.py`）透過 agentgateway 的 `extAuthz` 判斷。CEL 只能允許或回 403 拒絕；PDP 還能發起核准、對隱藏的 Agent 回 404，並說明拒絕原因。內建 Gateway 在程式內呼叫同一套邏輯。
 - token exchange 用它內建的 `backendAuth.oauthTokenExchange`，對接模擬 IdP。
 
-兩種 Gateway 都通過全部 20 個測試。行為不一樣的地方，測試會分別檢查各自實際的結果：
+兩種 Gateway 都通過全部測試。目前還不一樣的地方：
 
 | 行為 | 內建 Gateway | agentgateway |
 |---|---|---|
-| 需要核准 | 回 `approval_required` 和核准申請編號 | 直接拒絕；CEL 規則只有允許和拒絕 |
-| 為什麼被拒絕 | 錯誤會寫是哪條規則和決策編號 | 403，沒有規則名稱；原因只在它的 log |
-| 隱藏 Agent 的 card | 404，和不存在的 Agent 一樣 | 403，從狀態碼就看得出這個 Agent 存在 |
-| 政策改動生效 | 下一個請求就生效 | 約 0.4 秒後，等設定檔重新載入 |
+| 政策改動生效 | 下一個請求就生效 | 工具規則：約 0.4 秒後，等設定檔重新載入。A2A 的判斷（PDP）：下一個請求就生效 |
 | Gateway 的 span | 在 `var/traces.jsonl` | 不會寫到那裡；它的 access log 有同一個 trace id |
 | Task 擁有者檢查 | Gateway 檢查一次，Agent 再檢查一次 | 只有 Registry 和 Agent 檢查；Gateway 看不到 Task 屬於誰 |
 | 搜尋結果的權限提示 | Gateway 提供的端點 | Registry 自己讀 `policy.json` 判斷（只是提示，真正的判斷在 agentgateway） |
 
 我們實測時，Claude Code 透過 agentgateway 也能正常運作：`search_agents`、`invoke_agent`，再讀一次 resource。
+
+## 核准流程
+
+有些 Agent 對部分使用者需要先核准。`config/policy.json` 裡的 `approval_groups` 是誰可以申請，`approvers` 是誰可以核准。這裡 dave（財務部、沒有簽核角色）要用費用簽核 Agent，必須先經過 carol（有 `expense.approve`）核准：
+
+```bash
+python -m poc ask dave "幫我申請 3000 元交通費報銷"   # 被拒絕，拿到像 APR-1A2B3C 的編號
+python -m poc approvals --as carol                    # carol 可以處理的申請
+python -m poc approve APR-1A2B3C --as carol           # 或加 --reject
+python -m poc ask dave "幫我申請 3000 元交通費報銷"   # 放行一次
+```
+
+申請人不能核准自己的申請，沒有核准資格的人也不能核准；申請還在等待時再問一次，會拿到同一個編號。一次核准只能用一次，期限一小時。搜尋結果會把這個 Agent 標成 `approval_required`；核准後、還沒用掉之前會標成 `allowed`。
 
 ## 接上真的 Keycloak
 
@@ -137,7 +149,23 @@ POC_IDP=keycloak POC_GATEWAY=agentgateway python -m unittest -v
 - agentgateway 沒辦法依呼叫者動態要求 scope：`additionalParams` 不允許 `scope`，`scopes` 欄位又是寫死的。所以它在轉給 Registry 的那一跳，改用 `x-origin-client` header 傳它驗證過的 runtime。它會覆蓋客戶端送來的值，Registry 也只在「發給 Gateway 的 token（`azp=agent-gateway`）且 token 本身沒有源頭資訊」時才採用。有一個測試專門確認客戶端無法偽造。
 - Keycloak 會拒絕 Registry 換發 Agent 的 token（`Requested audience not available`），因為只有 Gateway 有那些 audience。這和模擬 IdP 的規則一樣。
 
-四種組合（模擬 IdP 或 Keycloak，內建 Gateway 或 agentgateway）都通過全部 20 個測試。Claude Code 接 Keycloak + agentgateway 也能正常運作，用 `whoami` 回報的是 Gateway 認定的身分。
+四種組合（模擬 IdP 或 Keycloak，內建 Gateway 或 agentgateway）都通過全部測試。Claude Code 接 Keycloak + agentgateway 也能正常運作，用 `whoami` 回報的是 Gateway 認定的身分。
+
+### Keycloak 委派（`act` claim）
+
+compose 檔也開啟了 Keycloak 的 `token-exchange-delegation` 預覽功能（加上 `parameterized-scopes` 和 FGAP v2 權限）。`tests/test_keycloak_delegation.py` 驗證它實際的行為：
+
+```bash
+POC_IDP=keycloak python -m unittest tests.test_keycloak_delegation -v
+```
+
+- 使用者走瀏覽器登入流程，要求 `delegation:client:agent-gateway` 並在同意畫面按下同意，token 裡就會有 `may_act`。測試會像真人一樣填登入表單、按同意。
+- agent-gateway 帶著自己 service account 的 token 當 `actor_token` 去換發，就能拿到帶 `act: {client_id: agent-gateway}` 的 token，audience 可以是它被允許的任何對象（Registry 或某個 Agent）。
+- 別的 client 不能拿這份同意來用。如果沒有幫 actor 設委派權限，`may_act` 會被默默拿掉，登入照樣成功。
+- 帶 `act` 或 `may_act` 的 token 不能再被換發，一般換發和委派換發都不行。所以 `act` 只能記一個執行者，串不成 gateway > registry > gateway > agent 這樣的鏈。只有拿著使用者原始 token 的那一方能換出委派 token。
+- 一般換發會拒絕帶 `may_act` 的使用者 token，所以委派和上面的 origin scope 做法不能用在同一個 token 上。
+
+結論：委派適合單跳，也就是一個 Agent 直接代替使用者做事。PoC 的多跳流程繼續用 origin scope 的做法。如果要在多跳裡用委派，得讓一個元件（Gateway）保管使用者的 token 並自己換出每一跳的 token，或改用在內部服務間傳遞的單次請求 token（OAuth Transaction Tokens，目前還是 IETF 草案）。
 
 ## 選用：讓 Agent 用真的 LLM 回答
 
@@ -153,13 +181,13 @@ POC_IDP=keycloak POC_GATEWAY=agentgateway python -m unittest -v
 | `POC_GATEWAY` | `builtin` | 設成 `agentgateway` 就改用 agentgateway 執行檔，不用 `poc/gateway.py` |
 | `POC_AGENTGATEWAY_BIN` | `bin/agentgateway-windows-amd64.exe` | agentgateway 執行檔的路徑 |
 
-連接埠設定在 `poc/settings.py` 和 `config/agents.json`。agentgateway 另外會開管理用的 15000、15020、15021 埠。
+連接埠設定在 `poc/settings.py` 和 `config/agents.json`（Gateway 18000、Registry 18200、PDP 18400、模擬 IdP 18300、Keycloak 18080、Agent 18101-18104）。agentgateway 另外會開管理用的 15000、15020、15021 埠。
 
 ## 這個 PoC 沒有做的事
 
 - 模擬 IdP 是替代品。它像 Keycloak 一樣簽 RS256 token 並公開 JWKS，但登入不檢查密碼，簽章金鑰是產生在 `var/` 裡的。Keycloak 的設定是開發模式，密碼和 secret 都是固定的。
 - 搜尋用關鍵字（BM25 加中文二字詞），不是向量語意搜尋。換掉搜尋方式也不影響 `search_agents` 的介面。
 - Gateway 把 Task 的擁有者記在記憶體裡。重啟後，舊 Task 的 resource 會被拒絕；Registry 的對應表則會保留。
-- 沒有 streaming、push notification、MCP Tasks，也沒有實際的核准流程，核准申請只會拿到一個編號。
+- 沒有 streaming、push notification、MCP Tasks。核准是透過一個簡單的 HTTP API 和 CLI 處理，沒有通知或核准畫面。
 - MCP 傳輸只回一般 JSON，沒有 SSE stream。
 - 全部在同一個 process 裡用 thread 執行（啟用時另外加上 agentgateway 的 process）。各元件之間本來就走 HTTP，要拆成獨立服務並不難。如果直接砍掉 Python process 而不是按 Ctrl+C，agentgateway 的 process 可能會留著。

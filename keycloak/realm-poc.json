@@ -1,6 +1,7 @@
 {
   "realm": "poc",
   "enabled": true,
+  "adminPermissionsEnabled": true,
   "accessTokenLifespan": 28800,
   "ssoSessionIdleTimeout": 28800,
   "ssoSessionMaxLifespan": 32400,
@@ -94,6 +95,54 @@
             "introspection.token.claim": "true",
             "claim.name": "roles",
             "multivalued": "true",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    },
+    {
+      "name": "delegation:client",
+      "protocol": "openid-connect",
+      "description": "OpenID Connect scope for agent/client token exchange delegation",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "parameterized.scope.type": "client-delegation",
+        "display.on.consent.screen": "true",
+        "always.display.consent": "true",
+        "is.parameterized.scope": "true",
+        "consent.screen.text": "${clientDelegationScopeConsentText}"
+      },
+      "protocolMappers": [
+        {
+          "name": "client may_act client_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-parameterized-scope-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "claim.name": "may_act.client_id",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "client delegation audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-parameterized-scope-audience-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "client may_act sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-parameterized-scope-client-sub-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "claim.name": "may_act.sub",
             "jsonType.label": "String"
           }
         }
@@ -360,7 +409,7 @@
       "secret": "gateway-dev-secret",
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
-      "serviceAccountsEnabled": false,
+      "serviceAccountsEnabled": true,
       "attributes": {
         "standard.token.exchange.enabled": "true"
       },
@@ -432,13 +481,45 @@
       ]
     },
     {
+      "clientId": "orchestrator-delegated",
+      "enabled": true,
+      "publicClient": true,
+      "consentRequired": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "http://127.0.0.1:18999/callback"
+      ],
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "poc-claims",
+        "origin-orchestrator-runtime"
+      ],
+      "optionalClientScopes": [
+        "delegation:client"
+      ],
+      "protocolMappers": [
+        {
+          "name": "aud-agent-gateway",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "included.client.audience": "agent-gateway"
+          }
+        }
+      ]
+    },
+    {
       "clientId": "agent-registry",
       "enabled": true,
       "publicClient": false,
       "secret": "registry-dev-secret",
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
-      "serviceAccountsEnabled": false,
+      "serviceAccountsEnabled": true,
       "attributes": {
         "standard.token.exchange.enabled": "true"
       },

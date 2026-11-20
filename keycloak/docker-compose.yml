@@ -3,7 +3,9 @@
 services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.8.2
-    command: ["start-dev", "--import-realm", "--http-port=8080"]
+    # token-exchange-delegation (preview) issues `act` claims; it needs parameterized-scopes and FGAP v2
+    command: ["start-dev", "--import-realm", "--http-port=8080",
+              "--features=token-exchange-delegation,parameterized-scopes"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
