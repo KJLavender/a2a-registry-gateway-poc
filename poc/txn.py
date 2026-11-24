@@ -95,12 +95,15 @@ class TxnTokenService:
         form = req.form()
         basic = req.headers.get("authorization", "")
         if basic[:6].lower() == "basic ":
-            client_id, _, secret = base64.b64decode(basic[6:]).decode("utf-8").partition(":")
+            try:
+                client_id, _, secret = base64.b64decode(basic[6:], validate=True).decode("utf-8").partition(":")
+            except ValueError:  # binascii.Error and UnicodeDecodeError are ValueErrors
+                return _oauth_error(401, "invalid_client", "malformed client credentials")
             form.setdefault("client_id", client_id)
             form.setdefault("client_secret", secret)
         client_id = form.get("client_id", "")
         if client_id not in EDGE_WORKLOADS or not hmac.compare_digest(
-                form.get("client_secret", ""), self.settings.client_secret(client_id)):
+                form.get("client_secret", "").encode("utf-8"), self.settings.client_secret(client_id).encode("utf-8")):
             return _oauth_error(401, "invalid_client", "only edge workloads may request transaction tokens")
         if form.get("grant_type") != TOKEN_EXCHANGE or form.get("requested_token_type") != TXN_TOKEN_TYPE \
                 or form.get("audience") != TRUST_DOMAIN or form.get("subject_token_type") != ACCESS_TOKEN_TYPE:

@@ -31,7 +31,7 @@ from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
 from a2a.server.tasks.task_updater import TaskUpdater
 from a2a.types import (
-    AgentCapabilities, AgentCard, AgentInterface, AgentProvider, AgentSkill, Task, TaskState, TaskStatus,
+    AgentCapabilities, AgentCard, AgentInterface, AgentProvider, AgentSkill, Role, Task, TaskState, TaskStatus,
 )
 from starlette.applications import Starlette
 from starlette.authentication import AuthCredentials, SimpleUser
@@ -42,6 +42,7 @@ from poc.common.identity import Verifier
 from poc.common.jwt import TokenError
 
 AGENT_ID = "hr-leave"
+PUBLIC_PATHS = ("/.well-known/agent-card.json",)
 _DATES = re.compile(r"\d{1,2}/\d{1,2}")
 
 
@@ -87,8 +88,9 @@ class LeaveExecutor(AgentExecutor):
             await asyncio.sleep(0.6 * self.speed)
             if context.task_id in self.canceled:
                 return
+            # Only what the user wrote: the agent's own question contains example dates
             history = [p.text for m in (context.current_task.history if context.current_task else [])
-                       for p in m.parts if p.text]
+                       if m.role == Role.ROLE_USER for p in m.parts if p.text]
             text = " ".join([*history, context.get_user_input()])
             wants_leave = any(w in text for w in ("請假", "休假", "休息", "病假", "事假", "day off", "time off", "leave request"))
             dates = list(dict.fromkeys(_DATES.findall(text)))  # history repeats earlier messages
@@ -124,9 +126,12 @@ class Guard:
         self.verify_txn = verify_txn
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] != "http" or scope["path"] != "/a2a":
-            await self.app(scope, receive, send)  # the agent card is public
+        if scope["type"] == "lifespan" or (scope["type"] == "http" and scope["method"] == "GET"
+                                           and scope["path"] in PUBLIC_PATHS):
+            await self.app(scope, receive, send)  # the agent card is public; everything else needs tokens
             return
+        if scope["type"] != "http":
+            return  # no websockets
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
         body = b""
         while True:

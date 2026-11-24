@@ -101,19 +101,36 @@ SEMANTIC_MIN = 0.42
 SEMANTIC_MARGIN = 0.2  # like RELATIVE_CUTOFF: drop matches far weaker than the best one
 RRF_K = 60
 
-Embedder = Callable[[list[str]], list[list[float]]]
+Embedder = Callable[[list[str], bool], list[list[float]]]  # (texts, remember)
 _model_lock = threading.Lock()
 _model: Any = None
+_load_error: Exception | None = None  # a failed load (no package, no network) is not retried every sync
+_vectors: dict[str, list[float]] = {}  # card text -> vector; catalog refreshes re-embed only new text
 
 
 def fastembed_embedder() -> Embedder:
     """Load the embedding model once per process (raises ImportError without fastembed)."""
-    global _model
-    from fastembed import TextEmbedding
+    global _model, _load_error
     with _model_lock:
+        if _load_error is not None:
+            raise _load_error
         if _model is None:
-            _model = TextEmbedding(EMBEDDING_MODEL, cache_dir=str(ROOT / ".cache" / "fastembed"))
-    return lambda texts: [list(map(float, v)) for v in _model.embed(texts)]
+            try:
+                from fastembed import TextEmbedding
+                _model = TextEmbedding(EMBEDDING_MODEL, cache_dir=str(ROOT / ".cache" / "fastembed"))
+            except Exception as e:
+                _load_error = e
+                raise
+
+    def embed(texts: list[str], remember: bool = False) -> list[list[float]]:
+        if not remember:  # queries: never cached, so memory does not grow with traffic
+            return [list(map(float, v)) for v in _model.embed(texts)]
+        missing = [t for t in dict.fromkeys(texts) if t not in _vectors]
+        if missing:
+            for text, v in zip(missing, _model.embed(missing)):
+                _vectors[text] = list(map(float, v))
+        return [_vectors[t] for t in texts]
+    return embed
 
 
 def _unit(v: list[float]) -> list[float]:
@@ -147,13 +164,17 @@ class HybridIndex:
 
     def prepare(self) -> None:
         """Embed the cards now (the catalog calls this before swapping the index in)."""
-        vectors = self.embed([t for _, t in self._texts]) if self._texts else []
+        try:
+            vectors = self.embed([t for _, t in self._texts], True) if self._texts else []
+        except Exception as e:  # keep the catalog usable; search falls back to keywords
+            log.warning("embedding the catalog failed, keyword search only: %s", e)
+            vectors = []
         self._vectors = [(a, _unit(v)) for (a, _), v in zip(self._texts, vectors)]
 
     def _similarities(self, query: str) -> dict[str, float]:
         if self._vectors is None:
             self.prepare()
-        q = _unit(self.embed([query])[0])
+        q = _unit(self.embed([query], False)[0])
         best: dict[str, float] = {}
         for agent_id, v in self._vectors:
             sim = sum(x * y for x, y in zip(q, v))
@@ -164,7 +185,11 @@ class HybridIndex:
         if not query.strip():
             return []
         keyword = {a: (score, terms) for a, score, terms in self.keyword.search(query, limit)}
-        sims = self._similarities(query)
+        try:
+            sims = self._similarities(query) if self._vectors != [] else {}
+        except Exception as e:
+            log.warning("semantic search failed, keyword results only: %s", e)
+            sims = {}
         floor = max(SEMANTIC_MIN, max(sims.values(), default=0.0) - SEMANTIC_MARGIN)
         semantic = sorted((a for a, s in sims.items() if s >= floor), key=lambda a: -sims[a])
         fused: dict[str, float] = {}

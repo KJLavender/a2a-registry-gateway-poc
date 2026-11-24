@@ -163,15 +163,17 @@ def _start(settings: Settings, servers: list[ThreadingHTTPServer]) -> Stack:
     policy = PolicyStore(settings.config_dir / "policy.json")
     approvals = ApprovalStore(settings.var_dir / "approvals.db")
     notifier = Notifier(settings, policy, settings.var_dir / "approvals.db")
-    stop = threading.Event()
-    threading.Thread(target=notifier.run, args=(stop,), name="approval-notifications", daemon=True).start()
     servers.append(serve(PolicyDecisionPoint(settings, policy, approvals, verify, notifier), settings.host,
                          settings.pdp_port))
 
     if settings.gateway_impl == "agentgateway":
-        stack = Stack(settings, servers, agents, registry, None, _start_agentgateway(settings), _stop=stop)
+        stack = Stack(settings, servers, agents, registry, None, _start_agentgateway(settings))
         threading.Thread(target=_regenerate_on_policy_change, args=(stack,), daemon=True).start()
-        return stack
-    gateway = AgentGateway(settings, policy, verify, TokenExchanger(settings, "agent-gateway"), approvals, notifier)
-    servers.append(serve(gateway, settings.host, settings.gateway_port))
-    return Stack(settings, servers, agents, registry, gateway, _stop=stop)
+    else:
+        gateway = AgentGateway(settings, policy, verify, TokenExchanger(settings, "agent-gateway"), approvals,
+                               notifier)
+        servers.append(serve(gateway, settings.host, settings.gateway_port))
+        stack = Stack(settings, servers, agents, registry, gateway)
+    # Started last: if anything above fails, no worker is left polling approvals.db
+    threading.Thread(target=notifier.run, args=(stack._stop,), name="approval-notifications", daemon=True).start()
+    return stack

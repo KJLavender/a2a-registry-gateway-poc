@@ -67,7 +67,7 @@ class A2AAuthorizer:
             request = self.approvals.open_or_get(p.sub, p.username, agent_id)
             decision.approval_request_id = request["id"]
             if self.notifier:
-                self.notifier.approval_requested(request)  # once per request; repeats are ignored
+                self.notifier.approval_requested(request)  # best effort; repeats are ignored
         return decision
 
 
@@ -207,7 +207,7 @@ class PolicyDecisionPoint:
                 sp.set(error=str(e))
                 return Response(e.status, {"error": str(e)})
         if self.notifier:
-            self.notifier.approval_decided(decided)
+            self.notifier.approval_decided(decided)  # best effort
         return Response(200, decided)
 
     def _inbox(self, req: Request) -> Response:

@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from poc.approvals import APPROVAL_TTL
 from poc.common.identity import Principal
 from poc.common.web import http
 from poc.policy import PolicyStore
@@ -38,7 +39,7 @@ class Notifier:
         self.settings = settings
         self.policy = policy
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(path), check_same_thread=False)
+        self._db = sqlite3.connect(str(path), check_same_thread=False, timeout=10)  # shares approvals.db
         self._lock = threading.Lock()
         with self._lock, self._db:
             self._db.execute("""CREATE TABLE IF NOT EXISTS notifications (
@@ -49,23 +50,34 @@ class Notifier:
 
     # --- events --------------------------------------------------------------------
 
+    # Both are called from the authorization path: a notification problem is logged, never raised,
+    # so the caller still gets its "approval required" answer or its decision.
+
     def approval_requested(self, row: dict[str, Any]) -> None:
-        for username in self._approvers(row["agent_id"], exclude=row["requester_name"]):
-            self._enqueue("approval.requested", username, row,
-                          f"{row['requester_name']} 申請使用 {row['agent_id']}（{row['id']}）。"
-                          f"核准：python -m poc approve {row['id']} --as {username}")
+        try:
+            for username in self._approvers(row["agent_id"], exclude=row["requester_name"]):
+                self._enqueue("approval.requested", username, row,
+                              f"{row['requester_name']} 申請使用 {row['agent_id']}（{row['id']}）。"
+                              f"核准：python -m poc approve {row['id']} --as {username}")
+        except Exception:
+            log.exception("could not queue approval.requested for %s", row.get("id"))
 
     def approval_decided(self, row: dict[str, Any]) -> None:
-        if row["status"] == "approved":
-            text = f"你對 {row['agent_id']} 的申請 {row['id']} 已由 {row['decided_by']} 核准，一小時內可以使用一次。"
-        else:
-            text = f"你對 {row['agent_id']} 的申請 {row['id']} 被 {row['decided_by']} 拒絕。"
-        self._enqueue("approval.decided", row["requester_name"], row, text)
+        try:
+            if row["status"] == "approved":
+                text = (f"你對 {row['agent_id']} 的申請 {row['id']} 已由 {row['decided_by']} 核准，"
+                        f"{APPROVAL_TTL // 60} 分鐘內可以使用一次。")
+            else:
+                text = f"你對 {row['agent_id']} 的申請 {row['id']} 被 {row['decided_by']} 拒絕。"
+            self._enqueue("approval.decided", row["requester_name"], row, text)
+        except Exception:
+            log.exception("could not queue approval.decided for %s", row.get("id"))
 
     def _approvers(self, agent_id: str, exclude: str) -> list[str]:
         users = self.settings.load("users.json")["users"]
         return [name for name, u in users.items() if name != exclude and self.policy.can_approve(
-            Principal(name, name, u["name"], tuple(u["groups"]), tuple(u["roles"]), ()), agent_id)]
+            Principal(name, name, u.get("name", name), tuple(u.get("groups", [])), tuple(u.get("roles", [])), ()),
+            agent_id)]
 
     def _enqueue(self, event: str, recipient: str, row: dict[str, Any], text: str) -> None:
         payload = {"text": text, "event": event, "recipient": recipient, "approval_id": row["id"],

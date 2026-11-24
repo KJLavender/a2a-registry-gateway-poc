@@ -72,7 +72,10 @@ def serve(app: App, host: str, port: int) -> ThreadingHTTPServer:
             req = Request(self.command, parts.path, dict(parse_qsl(parts.query)),
                           {k.lower(): v for k, v in self.headers.items()}, body)
             try:
-                resp = app(req)
+                if len(self.headers.get_all("Txn-Token") or []) > 1:  # which one counts would depend on order
+                    resp = Response(400, {"error": "more than one Txn-Token header"})
+                else:
+                    resp = app(req)
             except Exception:
                 log.error("unhandled error on %s %s\n%s", req.method, req.path, traceback.format_exc())
                 resp = Response(500, {"error": "internal server error"})

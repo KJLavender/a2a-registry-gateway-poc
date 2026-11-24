@@ -7,6 +7,7 @@ Where agentgateway behaves differently, the test asserts what it actually does a
 from __future__ import annotations
 
 import dataclasses
+from http.client import HTTPConnection
 import json
 import shutil
 import tempfile
@@ -365,6 +366,26 @@ class TransactionTokens(unittest.TestCase):
         status, _ = a2a_post("/agents/it-helpdesk/a2a", internal, self.RPC, bob_txn)
         self.assertEqual(status, 401)
 
+    def test_two_transaction_tokens_are_refused(self):
+        _, internal = registry_side("alice")
+        conn = HTTPConnection(SETTINGS.host, SETTINGS.registry_port, timeout=10)
+        conn.putrequest("POST", "/mcp")
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+        for name, value in (("Authorization", f"Bearer {internal}"), ("Content-Type", "application/json"),
+                            ("Content-Length", str(len(body))), ("Txn-Token", "a"), ("Txn-Token", "b")):
+            conn.putheader(name, value)
+        conn.endheaders(body)
+        self.assertEqual(conn.getresponse().status, 400)
+        conn.close()
+
+    def test_malformed_client_credentials_are_401(self):
+        status, body, _ = http("POST", f"{SETTINGS.txn_url}/token", form={"grant_type": TOKEN_EXCHANGE},
+                               headers={"Authorization": "Basic !!!"})
+        self.assertEqual((status, body["error"]), (401, "invalid_client"))
+        status, _, _ = http("POST", f"{SETTINGS.txn_url}/token", form={
+            "client_id": "agent-gateway", "client_secret": "密碼"})
+        self.assertEqual(status, 401)
+
     def test_only_the_edge_mints_and_only_for_outside_tokens(self):
         user_token, internal = registry_side("alice")
         form = {"grant_type": TOKEN_EXCHANGE, "requested_token_type": "urn:ietf:params:oauth:token-type:txn_token",
@@ -488,6 +509,17 @@ class FrameworkAgent(unittest.TestCase):
         self.assertEqual(sdk["attributes"]["framework"], "a2a-sdk")
         self.assertEqual(sdk["attributes"]["origin"], "orchestrator-runtime")
         self.assertTrue(any(s["name"] == "agent.execute" and s["parent_id"] == sdk["span_id"] for s in spans))
+
+    def test_dates_come_from_the_user_not_the_agents_question(self):
+        out = runtime.ask(SETTINGS, "alice", "我想請假", answers=["下禮拜二"], say=lambda _: None)
+        self.assertNotEqual(out.status, "completed", out.artifacts)  # "12/3" is only in the agent's example
+
+    def test_only_the_agent_card_is_public(self):
+        for path in ("/", "/a2a/", "/v1/message:send", "/.well-known/agent-card.json/../a2a"):
+            status, _, _ = http("POST", SETTINGS.agent_url("hr-leave") + path, json_body={
+                "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {"id": "x"}})
+            self.assertIn(status, (401, 404, 405, 307), path)
+            self.assertNotEqual(status, 200, path)
 
     def test_input_required_round_trip(self):
         out = runtime.ask(SETTINGS, "alice", "我想請假", answers=["12/3-12/4"], say=lambda _: None)
