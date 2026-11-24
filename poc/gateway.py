@@ -19,6 +19,8 @@ policy reads the origin runtime from it, and its purpose limits which A2A calls 
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import threading
 from typing import Any
@@ -38,7 +40,7 @@ from poc.settings import Settings
 from poc.txn import EDGE_A2A, HEADER as TXN_HEADER, TxnGate, mcp_purpose, purpose_allows
 
 COMPONENT = "agent-gateway"
-_AGENT_ROUTE = re.compile(r"^/agents/([a-z0-9-]+)/(a2a|\.well-known/agent-card\.json)$")
+_AGENT_ROUTE = re.compile(r"^/agents/([a-z0-9-]+)/(a2a/?|\.well-known/agent-card\.json)$")
 
 class GatewayMcp(McpServer):
     name = "agent-gateway"
@@ -121,7 +123,7 @@ class AgentGateway:
             return serve_mcp(self.mcp, req, self._authenticate)
         m = _AGENT_ROUTE.match(req.path)
         if m and m.group(1) in self.settings.agent_ports:
-            if m.group(2) == "a2a" and req.method == "POST":
+            if m.group(2).startswith("a2a") and req.method == "POST":
                 return self._a2a(req, m.group(1))
             if req.method == "GET":
                 return self._card(req, m.group(1))
@@ -175,12 +177,18 @@ class AgentGateway:
             return p
         if not self.policy.visible(p, agent_id):
             return Response(404, {"error": "not found"})
-        status, card, _ = http("GET", f"{self.settings.agent_url(agent_id)}/.well-known/agent-card.json", timeout=5)
+        status, card, headers = http("GET", f"{self.settings.agent_url(agent_id)}/.well-known/agent-card.json",
+                                     timeout=5)
         if status != 200:
             return Response(502, {"error": "agent card unavailable"})
         for interface in card.get("supportedInterfaces", []):
             interface["url"] = f"{self.settings.gateway_url}/agents/{agent_id}/a2a"
-        return Response(200, card)
+        # The card served here differs from the agent's (rewritten URL), so it gets its own ETag
+        etag = '"' + hashlib.sha256(json.dumps(card, sort_keys=True).encode()).hexdigest()[:32] + '"'
+        if req.headers.get("if-none-match") == etag:
+            return Response(304, None, {"ETag": etag})
+        return Response(200, card, {"ETag": etag,
+                                    "Cache-Control": headers.get("cache-control", "private, max-age=300")})
 
     def _a2a(self, req: Request, agent_id: str) -> Response:
         try:

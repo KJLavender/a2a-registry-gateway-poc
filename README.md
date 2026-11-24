@@ -86,6 +86,8 @@ claude mcp add --transport http agent-gateway http://127.0.0.1:18000/mcp \
 
 Ask Claude Code something like "幫我分析今天晨會報表的良率異常，用 agent-gateway 的工具". In our runs with Sonnet it called `search_agents`, `invoke_agent`, then read the task resource once; that read waited about 3 seconds and returned the finished result. Signed in as bob, it stopped at `denied` and explained that the agent exists but he lacks access. Tokens last 8 hours.
 
+After transaction tokens were added we ran Claude Code (Sonnet, `claude -p`) again through both gateways with four requests: alice's report (completed), bob's report (stopped at `denied` without trying `invoke_agent`), bob's "下禮拜想休息兩天" (it found the leave agent by meaning and filed 12/3-12/4), and `whoami` (it reported the runtime and the transaction id). Both gateways gave the same tool calls and results.
+
 ## Swap in agentgateway
 
 [agentgateway](https://github.com/agentgateway/agentgateway) is an open source MCP/A2A proxy (Rust, Apache-2.0, hosted by the Agentic AI Foundation). The PoC can use it in place of `poc/gateway.py`. The registry, agents and tests stay the same.
@@ -121,6 +123,7 @@ All tests pass with both gateways. What is still different:
 | Gateway spans | In `var/traces.jsonl` | Sent by agentgateway to the OTLP collector (see Jaeger below); not in the JSONL file |
 | Task ownership | Checked at the gateway and again in the agent | Only in the registry and the agent; the gateway cannot see task owners |
 | Search access hints | Gateway endpoint | The registry evaluates `policy.json` itself (hints only; agentgateway makes the real decision) |
+| Agent card with `If-None-Match` | `304 Not Modified` | Always the full card. agentgateway 1.7 rewrites the card body and answered `503` when the agent sent a 304, so the config drops conditional headers on A2A routes |
 
 Claude Code also worked through agentgateway in our run: `search_agents`, `invoke_agent`, then one resource read.
 
@@ -237,7 +240,9 @@ The first run had 53 failures. Most came from one bug (`POST /a2a/` with a trail
 - A message part with a media type the agent does not accept was taken instead of refused with -32005.
 - The agent card had no `Cache-Control` or `ETag` header.
 
-Now: 0 failures, 55 MUST requirements passed. What is not tested: gRPC and HTTP+JSON (this server offers JSON-RPC only), streaming, and the authentication checks (the test agent declares no security scheme).
+Now: 0 failures, 55 MUST requirements passed. What is not tested: gRPC and HTTP+JSON (this server offers JSON-RPC only), streaming, and the authentication requirements (this TCK version has no automated tests for them).
+
+The TCK also runs through each gateway (`python -m poc.tck_sut --via-gateway`, with `POC_GATEWAY` picking the gateway). That starts a full stack with the test agent behind it and real token checks. The TCK cannot send credentials, so a small test proxy adds alice's token to each request. Both gateways give the same result as the agent alone: 0 failures. Running it this way found two gaps in the built-in gateway (no route for `/a2a/` and no caching headers on the card it serves) and the agentgateway 304 problem above. CI runs all three: direct, built-in, agentgateway.
 
 ## Optional: real LLM answers
 

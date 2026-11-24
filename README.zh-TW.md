@@ -86,6 +86,8 @@ claude mcp add --transport http agent-gateway http://127.0.0.1:18000/mcp \
 
 然後問 Claude Code，例如「幫我分析今天晨會報表的良率異常，用 agent-gateway 的工具」。我們用 Sonnet 實測時，它依序呼叫 `search_agents`、`invoke_agent`，再讀一次 Task resource；那一次讀取等了約 3 秒，直接拿到完成的結果。換成 bob 登入時，它看到 `denied` 就停下來，說明這個 Agent 存在但他沒有權限。token 有效 8 小時。
 
+加上 transaction token 之後，我們用 Claude Code（Sonnet，`claude -p`）在兩種 Gateway 上各重跑了四個請求：alice 的報表分析（完成）、bob 的報表分析（看到 `denied` 就停，沒有硬試 `invoke_agent`）、bob 說「下禮拜想休息兩天」（靠語意找到請假 Agent，送出 12/3-12/4 的申請），以及 `whoami`（回報了 runtime 和交易編號）。兩種 Gateway 的工具呼叫順序和結果都一樣。
+
 ## 換成 agentgateway
 
 [agentgateway](https://github.com/agentgateway/agentgateway) 是開源的 MCP／A2A proxy（Rust 寫的，Apache-2.0 授權，由 Agentic AI Foundation 托管）。這個 PoC 可以用它取代 `poc/gateway.py`，Registry、Agent 和測試都不用改。
@@ -121,6 +123,7 @@ launcher 會根據 `config/policy.json` 產生 `var/agentgateway.yaml`，再啟�
 | Gateway 的 span | 在 `var/traces.jsonl` | agentgateway 自己送到 OTLP 收集端（見下面的 Jaeger），不在 JSONL 裡 |
 | Task 擁有者檢查 | Gateway 檢查一次，Agent 再檢查一次 | 只有 Registry 和 Agent 檢查；Gateway 看不到 Task 屬於誰 |
 | 搜尋結果的權限提示 | Gateway 提供的端點 | Registry 自己讀 `policy.json` 判斷（只是提示，真正的判斷在 agentgateway） |
+| 帶 `If-None-Match` 取 Agent Card | 回 `304 Not Modified` | 一律回完整的 card。agentgateway 1.7 會改寫 card 內容，Agent 回 304 時它回了 `503`，所以設定裡在 A2A 路由上拿掉條件式請求的 header |
 
 我們實測時，Claude Code 透過 agentgateway 也能正常運作：`search_agents`、`invoke_agent`，再讀一次 resource。
 
@@ -237,7 +240,9 @@ python run_tck.py --sut-host http://127.0.0.1:18199 --transport jsonrpc
 - 訊息裡有 Agent 不接受的 media type 時，應該用 -32005 拒絕，原本照單全收。
 - Agent Card 沒有 `Cache-Control` 和 `ETag` header。
 
-現在：0 個失敗，55 個 MUST 項目通過。沒測到的有：gRPC 和 HTTP+JSON（這個 server 只提供 JSON-RPC）、streaming，以及驗證相關的檢查（測試用的 Agent 沒有宣告驗證方式）。
+現在：0 個失敗，55 個 MUST 項目通過。沒測到的有：gRPC 和 HTTP+JSON（這個 server 只提供 JSON-RPC）、streaming，以及驗證相關的要求（這版 TCK 沒有這部分的自動測試）。
+
+TCK 也會經過兩種 Gateway 各跑一次（`python -m poc.tck_sut --via-gateway`，用 `POC_GATEWAY` 選 Gateway）。這會起一整套服務，測試用的 Agent 放在 Gateway 後面，token 檢查都是真的。TCK 沒辦法帶憑證，所以前面放一個測試用的小 proxy，幫每個請求加上 alice 的 token。兩種 Gateway 的結果都跟直接打 Agent 一樣：0 個失敗。這樣跑抓到內建 Gateway 的兩個缺口（沒有 `/a2a/` 的路由、轉出去的 card 沒有快取 header），以及上面 agentgateway 碰到 304 的問題。CI 三種都會跑：直接、內建 Gateway、agentgateway。
 
 ## 選用：讓 Agent 用真的 LLM 回答
 

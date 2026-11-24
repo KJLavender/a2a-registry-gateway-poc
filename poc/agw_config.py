@@ -108,6 +108,9 @@ def build(settings: Settings) -> dict[str, Any]:
                          # CEL alone can only allow or deny with a 403.
                          "extAuthz": pdp_check("/authz/a2a"),
                          "urlRewrite": {"path": {"prefix": "/"}},
+                         # The a2a policy rewrites the agent card body; on a 304 (no body) agentgateway 1.7
+                         # answers 503. Drop conditional headers so the agent always sends the full card.
+                         "transformations": {"request": {"remove": ["if-none-match", "if-modified-since"]}},
                          "a2a": {}},
             "backends": [{"host": f"{settings.host}:{port}", "policies": exchange(f"agent:{agent_id}")}],
         })

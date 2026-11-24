@@ -455,6 +455,20 @@ class TransactionTokens(unittest.TestCase):
             "audience": "agent:it-helpdesk"})
         self.assertEqual(status, 400)
 
+    def test_gateway_keeps_a2a_http_details(self):
+        token = login(SETTINGS, "alice", "orchestrator-runtime")
+        auth = {"Authorization": f"Bearer {token}"}
+        card_url = f"{SETTINGS.gateway_url}/agents/it-helpdesk/.well-known/agent-card.json"
+        status, _, headers = http("GET", card_url, headers=auth)
+        self.assertEqual(status, 200)
+        self.assertIn("max-age", headers.get("cache-control", ""))
+        # agentgateway 1.7 cannot rewrite a 304 card (it answered 503), so it always sends the full card
+        self.assertEqual(http("GET", card_url, headers={**auth, "If-None-Match": headers["etag"]})[0],
+                         200 if AGW else 304)
+        status, body = a2a_post("/agents/it-helpdesk/a2a/", token, {  # trailing slash, as the TCK sends it
+            "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {"id": "nope"}})
+        self.assertEqual(body["error"]["code"], -32001)
+
     def test_a2a_version_header_required(self):
         status, body, _ = http("POST", f"{SETTINGS.gateway_url}/agents/it-helpdesk/a2a", json_body={
             "jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {"message": text_message(ROLE_USER, "hi")}},
