@@ -564,6 +564,124 @@ class FrameworkAgent(unittest.TestCase):
         self.assertEqual(body["error"]["code"], -32001)  # TaskNotFound: the SDK keeps users' tasks apart
 
 
+class BoundApprovals(unittest.TestCase):
+    """An approval covers one exact message; access is checked again when the approved message is sent."""
+
+    EXPENSE = "expense-approver"
+
+    @staticmethod
+    def decide(approval_id: str, user: str = "carol") -> int:
+        return http("POST", f"{SETTINGS.pdp_url}/approvals/{approval_id}/approve",
+                    headers={"Authorization": f"Bearer {login(SETTINGS, user, 'orchestrator-runtime')}"})[0]
+
+    @staticmethod
+    def edit_policy(change) -> str:
+        path = SETTINGS.config_dir / "policy.json"
+        original = path.read_text(encoding="utf-8")
+        policy = json.loads(original)
+        change(policy)
+        path.write_text(json.dumps(policy), encoding="utf-8")
+        time.sleep(1.5 if AGW else 0.05)
+        return original
+
+    @staticmethod
+    def restore_policy(original: str) -> None:
+        (SETTINGS.config_dir / "policy.json").write_text(original, encoding="utf-8")
+        time.sleep(1.5 if AGW else 0.05)
+
+    def ask(self, dave: McpClient, message: str) -> tuple[dict, bool]:
+        return dave.call_tool("invoke_agent", {"agent_id": self.EXPENSE, "message": message})
+
+    def test_approval_covers_only_the_approved_request(self):
+        dave = mcp_for("dave")
+        asked, _ = self.ask(dave, "800 元 計程車")
+        approval_id = asked["approval_request_id"]
+        status, listed, _ = http("GET", f"{SETTINGS.pdp_url}/approvals", headers={
+            "Authorization": f"Bearer {login(SETTINGS, 'carol', 'orchestrator-runtime')}"})
+        row = next(r for r in listed["to_decide"] if r["id"] == approval_id)
+        self.assertIn("800 元 計程車", row["summary"])  # the approver sees what she approves
+        self.assertEqual(self.decide(approval_id), 200)
+
+        other, is_error = self.ask(dave, "80000 元 計程車")  # a different amount is a different request
+        self.assertTrue(is_error)
+        self.assertEqual(other["effect"], "approval_required")
+        self.assertNotEqual(other["approval_request_id"], approval_id)
+        self.assertIn("800 元 計程車", other["reason"])  # says which request the approval covers
+
+        same, is_error = self.ask(dave, "  800 元 計程車 ")  # the same content, spacing aside
+        self.assertFalse(is_error, same)
+        self.assertEqual(read_until_done(dave, same["resource_uri"])["state"], "TASK_STATE_COMPLETED")
+
+    def test_answers_to_the_agent_need_their_own_approval(self):
+        dave = mcp_for("dave")
+        asked, _ = self.ask(dave, "申請計程車費報銷")  # no amount: the agent will ask for it
+        self.assertEqual(self.decide(asked["approval_request_id"]), 200)
+        inv, is_error = self.ask(dave, "申請計程車費報銷")
+        self.assertFalse(is_error, inv)
+        self.assertEqual(read_until_done(dave, inv["resource_uri"])["state"], "TASK_STATE_INPUT_REQUIRED")
+
+        answer, is_error = dave.call_tool("provide_input", {"task_id": inv["task_id"], "message": "90000 元 計程車"})
+        self.assertTrue(is_error)  # the amount was not part of what carol approved
+        self.assertEqual(answer["effect"], "approval_required")
+        approvals = http("GET", f"{SETTINGS.pdp_url}/approvals", headers={
+            "Authorization": f"Bearer {login(SETTINGS, 'carol', 'orchestrator-runtime')}"})[1]["to_decide"]
+        summary = next(r["summary"] for r in approvals if r["id"] == answer["approval_request_id"])
+        self.assertIn("90000", summary)
+        self.assertIn(inv["task_id"][:8], summary)
+
+        self.assertEqual(self.decide(answer["approval_request_id"]), 200)
+        done, is_error = dave.call_tool("provide_input", {"task_id": inv["task_id"], "message": "90000 元 計程車"})
+        self.assertFalse(is_error, done)
+        self.assertEqual(read_until_done(dave, done["resource_uri"])["state"], "TASK_STATE_COMPLETED")
+
+    def test_access_revoked_while_waiting_beats_the_approval(self):
+        dave = mcp_for("dave")
+        asked, _ = self.ask(dave, "1200 元 高鐵")
+        self.assertEqual(self.decide(asked["approval_request_id"]), 200)
+
+        def no_approvals(policy):  # dave's group may no longer ask for approval at all
+            policy["agents"][self.EXPENSE]["invoke"]["approval_groups"] = []
+        original = self.edit_policy(no_approvals)
+        try:
+            refused, is_error = self.ask(dave, "1200 元 高鐵")
+            self.assertTrue(is_error)
+            self.assertEqual(refused["effect"], "deny")
+        finally:
+            self.restore_policy(original)
+        inv, is_error = self.ask(dave, "1200 元 高鐵")  # the refused attempt did not use the approval up
+        self.assertFalse(is_error, inv)
+
+    def test_agent_hidden_after_approval(self):
+        dave = mcp_for("dave")
+        asked, _ = self.ask(dave, "450 元 停車費")
+        self.assertEqual(self.decide(asked["approval_request_id"]), 200)
+
+        def hide(policy):
+            policy["agents"][self.EXPENSE].update({"visibility": "hidden", "visible_to_groups": ["secops"]})
+        original = self.edit_policy(hide)
+        try:
+            refused, is_error = self.ask(dave, "450 元 停車費")
+            self.assertTrue(is_error)
+            self.assertIn("unknown agent_id", refused["error"])  # same answer as an agent that does not exist
+        finally:
+            self.restore_policy(original)
+        self.assertFalse(self.ask(dave, "450 元 停車費")[1])  # use it up so other tests start clean
+
+    def test_approvals_expire(self):
+        dave = mcp_for("dave")
+        asked, _ = self.ask(dave, "300 元 郵資")
+        with mock.patch("poc.approvals.PENDING_TTL", -1):  # nobody decided it in time
+            self.assertEqual(self.decide(asked["approval_request_id"]), 409)
+        again, _ = self.ask(dave, "300 元 郵資")
+        self.assertNotEqual(again["approval_request_id"], asked["approval_request_id"])  # a fresh request
+        self.assertEqual(self.decide(again["approval_request_id"]), 200)
+        with mock.patch("poc.approvals.APPROVAL_TTL", -1):  # approved, but not used in time
+            late, is_error = self.ask(dave, "300 元 郵資")
+        self.assertTrue(is_error)
+        self.assertEqual(late["effect"], "approval_required")
+        self.assertFalse(self.ask(dave, "300 元 郵資")[1])  # still valid without the patch; use it up
+
+
 class InputValidation(unittest.TestCase):
     def test_bad_arguments_are_errors_not_crashes(self):
         alice = mcp_for("alice")

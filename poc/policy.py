@@ -114,6 +114,6 @@ class PolicyStore:
             return {"visible": False}
         d = self.invocation(p, agent_id)
         if d.effect == APPROVAL and has_grant:
-            return {"visible": True, "access": "allowed", "reason": "approved for one invocation",
+            return {"visible": True, "access": "allowed", "reason": "approved for one exact request; send it as it was approved",
                     "decision_id": d.decision_id}
         return {"visible": True, "access": ACCESS_LABEL[d.effect], "reason": d.reason, "decision_id": d.decision_id}

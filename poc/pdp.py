@@ -14,13 +14,14 @@ The built-in gateway uses `A2AAuthorizer` in-process, so both gateways make the 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
 
 from poc.approvals import ApprovalError, ApprovalStore
 from poc.common import trace
-from poc.common.a2a import POLICY_DENIED, is_continuation, is_new_task
+from poc.common.a2a import POLICY_DENIED, camel_keys, is_continuation, is_new_task, message_text
 from poc.common.identity import Principal, Verifier
 from poc.common.jwt import TokenError
 from poc.common.web import Request, Response, RpcError, rpc_response
@@ -37,12 +38,36 @@ _DECIDE_PATH = re.compile(r"^/approvals/(APR-[0-9A-F]+)/(approve|reject)$")
 NOT_FOUND = Response(404, "route not found", {"Content-Type": "text/plain"})
 
 
+_CONTENT_FIELDS = ("text", "data", "url", "raw", "filename", "mediaType")
+
+
+def action_of(agent_id: str, rpc: Any) -> tuple[str, str]:
+    """(action hash, summary) of a SendMessage: what an approval is bound to and what the approver reads.
+
+    The hash covers the target agent, the task being continued and the content of every part. Ids that
+    change on each send (messageId, contextId) are left out, so resending the same request matches.
+    """
+    params = camel_keys(rpc.get("params") if isinstance(rpc, dict) else {}) or {}
+    message = params.get("message") if isinstance(params.get("message"), dict) else {}
+    parts = [{k: (v.strip() if k == "text" and isinstance(v, str) else v) for k, v in part.items()
+              if k in _CONTENT_FIELDS} for part in message.get("parts", []) if isinstance(part, dict)]
+    task_id = message.get("taskId") or None
+    canonical = json.dumps({"agent": agent_id, "task": task_id, "parts": parts}, sort_keys=True,
+                           ensure_ascii=False, separators=(",", ":"))
+    text = " ".join(message_text(message).split())[:300] or "(no text)"
+    summary = f"補充 Task {str(task_id)[:8]} 的內容：{text}" if task_id else text
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), summary
+
+
 class A2AAuthorizer:
     """A2A rules shared by both gateways. Callers check visibility first (hidden = 404).
 
-    - New task: the full invocation decision, every time (approvals included).
-    - Continuing a task (provide_input): refused if the user may no longer invoke the agent at all;
-      an approval-gated user may continue the task that was approved.
+    - Every message that starts or continues a task gets the full invocation decision, at the moment it
+      is sent: a user whose access was revoked while waiting (for an approval, or to answer a question)
+      is refused, and an approval granted earlier does not override that.
+    - For an approval-gated user, an approval covers one exact message (`action_of`). Continuing a task
+      needs its own approval too: the details an agent asks for (an amount, say) are part of what the
+      approver must see.
     - GetTask / CancelTask: allowed here; the agent only serves the task's owner.
     """
 
@@ -51,23 +76,29 @@ class A2AAuthorizer:
         self.approvals = approvals
         self.notifier = notifier
 
-    def continuation(self, p: Principal, agent_id: str) -> Decision:
-        decision = self.policy.invocation(p, agent_id)
-        if decision.effect == APPROVAL:
-            return Decision(ALLOW, "continuing a task the user was allowed to start", decision.rule)
-        return decision
+    def new_task(self, p: Principal, agent_id: str, rpc: Any) -> Decision:
+        return self._decide(p, agent_id, rpc)
 
-    def new_task(self, p: Principal, agent_id: str) -> Decision:
+    def continuation(self, p: Principal, agent_id: str, rpc: Any) -> Decision:
+        return self._decide(p, agent_id, rpc)
+
+    def _decide(self, p: Principal, agent_id: str, rpc: Any) -> Decision:
         decision = self.policy.invocation(p, agent_id)  # authoritative, every time
-        if decision.effect == APPROVAL:
-            grant = self.approvals.take_grant(p.sub, agent_id)
-            if grant:
-                return Decision(ALLOW, f"approved by {grant['decided_by']}", decision.rule,
-                                approval_request_id=grant["id"])
-            request = self.approvals.open_or_get(p.sub, p.username, agent_id)
-            decision.approval_request_id = request["id"]
-            if self.notifier:
-                self.notifier.approval_requested(request)  # best effort; repeats are ignored
+        if decision.effect != APPROVAL:
+            return decision
+        action, summary = action_of(agent_id, rpc)
+        grant = self.approvals.take_grant(p.sub, agent_id, action)
+        if grant:
+            return Decision(ALLOW, f"approved by {grant['decided_by']} for this exact request", decision.rule,
+                            approval_request_id=grant["id"])
+        others = [g["summary"] for g in self.approvals.unused_grants(p.sub, agent_id)]
+        request = self.approvals.open_or_get(p.sub, p.username, agent_id, action, summary)
+        decision.approval_request_id = request["id"]
+        if others:  # tell the caller (often an LLM that reworded the request) what is already approved
+            decision.reason += ("; an approval you hold covers a different request, send it exactly as approved: "
+                                + " | ".join(f"「{s}」" for s in others))
+        if self.notifier:
+            self.notifier.approval_requested(request)  # best effort; repeats are ignored
         return decision
 
 
@@ -145,9 +176,9 @@ class PolicyDecisionPoint:
                 return Response(403, rpc_response(rpc.get("id") if isinstance(rpc, dict) else None, error=RpcError(
                     POLICY_DENIED, f"{method} is outside this transaction's purpose ({p.purpose})")))
             if is_new_task(rpc):
-                decision = self.authorizer.new_task(p, agent_id)
+                decision = self.authorizer.new_task(p, agent_id, rpc)
             elif is_continuation(rpc):
-                decision = self.authorizer.continuation(p, agent_id)
+                decision = self.authorizer.continuation(p, agent_id, rpc)
             else:
                 return allow  # GetTask/CancelTask: the agent serves the owner only
             sp.set(policy_effect=decision.effect, policy_rule=decision.rule, decision_id=decision.decision_id,

@@ -1,8 +1,13 @@
 """Approval requests for agents whose policy says "approval_required".
 
-Flow: a requester's invocation is refused with an approval request id; an approver (per the agent's
-`approvers` rule in policy.json, never the requester) approves it; the requester's next invocation of
-that agent is allowed once, within APPROVAL_TTL.
+Flow: a requester's message is refused with an approval request id; an approver (per the agent's
+`approvers` rule in policy.json, never the requester) approves it; the requester may then send that same
+message once, within APPROVAL_TTL.
+
+An approval covers one exact request, not the agent in general. It stores `action_hash`, a SHA-256 of the
+target agent, the task being continued (if any) and the message content, plus a `summary` the approver
+reads. A different message (another amount, say) needs its own approval. Requests nobody decides expire
+after PENDING_TTL.
 """
 from __future__ import annotations
 
@@ -13,9 +18,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-APPROVAL_TTL = 3600
+APPROVAL_TTL = 3600  # an approved request must be used within this time
+PENDING_TTL = 24 * 3600  # an undecided request expires after this time
 _COLUMNS = ("id", "requester_sub", "requester_name", "agent_id", "status", "created_at",
-            "decided_by", "decided_at", "consumed_at")
+            "decided_by", "decided_at", "consumed_at", "action_hash", "summary")
 
 
 class ApprovalError(Exception):
@@ -27,15 +33,20 @@ class ApprovalError(Exception):
 class ApprovalStore:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(path), check_same_thread=False)
+        self._db = sqlite3.connect(str(path), check_same_thread=False, timeout=10)
         self._lock = threading.Lock()
         with self._lock, self._db:
             self._db.execute("""CREATE TABLE IF NOT EXISTS approvals (
                 id TEXT PRIMARY KEY, requester_sub TEXT, requester_name TEXT, agent_id TEXT, status TEXT,
                 created_at REAL, decided_by TEXT, decided_at REAL, consumed_at REAL)""")
-            # At most one pending request per requester and agent, even across processes/connections
-            self._db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_pending ON approvals (requester_sub, agent_id)
-                WHERE status = 'pending'""")
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(approvals)")}
+            for name in ("action_hash", "summary"):  # databases from before approvals were bound to content
+                if name not in columns:
+                    self._db.execute(f"ALTER TABLE approvals ADD COLUMN {name} TEXT DEFAULT ''")
+            self._db.execute("DROP INDEX IF EXISTS one_pending")
+            # At most one pending request per requester, agent and exact request, even across connections
+            self._db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_pending_action
+                ON approvals (requester_sub, agent_id, action_hash) WHERE status = 'pending'""")
 
     def _rows(self, where: str, args: tuple[Any, ...]) -> list[dict[str, Any]]:
         with self._lock:
@@ -43,31 +54,44 @@ class ApprovalStore:
                                     "ORDER BY created_at", args).fetchall()
         return [dict(zip(_COLUMNS, r)) for r in rows]
 
+    def _expire_stale(self) -> None:
+        with self._lock, self._db:
+            self._db.execute("UPDATE approvals SET status = 'expired' WHERE status = 'pending' AND created_at < ?",
+                             (time.time() - PENDING_TTL,))
+
     def get(self, approval_id: str) -> dict[str, Any] | None:
         rows = self._rows("id = ?", (approval_id,))
         return rows[0] if rows else None
 
-    def open_or_get(self, requester_sub: str, requester_name: str, agent_id: str) -> dict[str, Any]:
+    def open_or_get(self, requester_sub: str, requester_name: str, agent_id: str, action_hash: str,
+                    summary: str) -> dict[str, Any]:
+        self._expire_stale()
         with self._lock, self._db:
             self._db.execute("INSERT OR IGNORE INTO approvals "
-                             "(id, requester_sub, requester_name, agent_id, status, created_at) "
-                             "VALUES (?, ?, ?, ?, 'pending', ?)",
+                             "(id, requester_sub, requester_name, agent_id, status, created_at, action_hash, summary) "
+                             "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
                              (f"APR-{secrets.token_hex(3).upper()}", requester_sub, requester_name, agent_id,
-                              time.time()))
-        return self._rows("requester_sub = ? AND agent_id = ? AND status = 'pending'", (requester_sub, agent_id))[0]
+                              time.time(), action_hash, summary))
+        return self._rows("requester_sub = ? AND agent_id = ? AND action_hash = ? AND status = 'pending'",
+                          (requester_sub, agent_id, action_hash))[0]
 
-    def take_grant(self, requester_sub: str, agent_id: str) -> dict[str, Any] | None:
-        """Consume one unexpired approval for this requester and agent, if there is one."""
+    def take_grant(self, requester_sub: str, agent_id: str, action_hash: str) -> dict[str, Any] | None:
+        """Consume one unexpired approval for exactly this request, if there is one."""
         with self._lock, self._db:
             row = self._db.execute(
-                "SELECT id, decided_by FROM approvals WHERE requester_sub = ? AND agent_id = ? "
+                "SELECT id, decided_by FROM approvals WHERE requester_sub = ? AND agent_id = ? AND action_hash = ? "
                 "AND status = 'approved' AND decided_at > ? ORDER BY decided_at LIMIT 1",
-                (requester_sub, agent_id, time.time() - APPROVAL_TTL)).fetchone()
+                (requester_sub, agent_id, action_hash, time.time() - APPROVAL_TTL)).fetchone()
             if row is None:
                 return None
             used = self._db.execute("UPDATE approvals SET status = 'consumed', consumed_at = ? "
                                     "WHERE id = ? AND status = 'approved'", (time.time(), row[0])).rowcount
         return {"id": row[0], "decided_by": row[1]} if used else None
+
+    def unused_grants(self, requester_sub: str, agent_id: str) -> list[dict[str, Any]]:
+        """Approved, unexpired and not yet used: what the requester could still send."""
+        return self._rows("requester_sub = ? AND agent_id = ? AND status = 'approved' AND decided_at > ?",
+                          (requester_sub, agent_id, time.time() - APPROVAL_TTL))
 
     def restore(self, approval_id: str) -> None:
         """Give an approval back when the call it was used for never reached the agent."""
@@ -83,11 +107,11 @@ class ApprovalStore:
             self.restore(rows[-1]["id"])
 
     def has_grant(self, requester_sub: str, agent_id: str) -> bool:
-        return bool(self._rows("requester_sub = ? AND agent_id = ? AND status = 'approved' AND decided_at > ?",
-                               (requester_sub, agent_id, time.time() - APPROVAL_TTL)))
+        return bool(self.unused_grants(requester_sub, agent_id))
 
     def decide(self, approval_id: str, approver_sub: str, approver_name: str, approve: bool,
                may_approve: bool) -> dict[str, Any]:
+        self._expire_stale()
         row = self.get(approval_id)
         if row is None or not may_approve:
             raise ApprovalError(404 if row is None else 403, "approval request not found or not yours to decide")
@@ -102,4 +126,5 @@ class ApprovalStore:
         return self.get(approval_id) or {}
 
     def pending(self) -> list[dict[str, Any]]:
+        self._expire_stale()
         return self._rows("status = 'pending'", ())

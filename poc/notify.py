@@ -57,7 +57,8 @@ class Notifier:
         try:
             for username in self._approvers(row["agent_id"], exclude=row["requester_name"]):
                 self._enqueue("approval.requested", username, row,
-                              f"{row['requester_name']} 申請使用 {row['agent_id']}（{row['id']}）。"
+                              f"{row['requester_name']} 申請使用 {row['agent_id']}（{row['id']}）："
+                              f"「{row.get('summary') or ''}」。核准只對這一則內容有效。"
                               f"核准：python -m poc approve {row['id']} --as {username}")
         except Exception:
             log.exception("could not queue approval.requested for %s", row.get("id"))
@@ -81,7 +82,8 @@ class Notifier:
 
     def _enqueue(self, event: str, recipient: str, row: dict[str, Any], text: str) -> None:
         payload = {"text": text, "event": event, "recipient": recipient, "approval_id": row["id"],
-                   "agent_id": row["agent_id"], "requester": row["requester_name"], "status": row["status"]}
+                   "agent_id": row["agent_id"], "requester": row["requester_name"], "status": row["status"],
+                   "request": row.get("summary") or ""}
         status = "pending" if self.settings.approval_webhook else "skipped"
         with self._lock, self._db:  # the unique key makes a repeated event a no-op
             self._db.execute(

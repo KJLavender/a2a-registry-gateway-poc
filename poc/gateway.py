@@ -219,12 +219,12 @@ class AgentGateway:
                     POLICY_DENIED, f"{method} is outside this transaction's purpose ({p.purpose})")))
             grant_id = None
             if new_task or is_continuation(msg):
-                decision = (self.authorizer.new_task if new_task else self.authorizer.continuation)(p, agent_id)
+                decision = (self.authorizer.new_task if new_task else self.authorizer.continuation)(p, agent_id, msg)
                 sp.set(policy_effect=decision.effect, policy_rule=decision.rule, decision_id=decision.decision_id,
                        approval_request_id=decision.approval_request_id)
                 if not decision.allowed:
                     return refusal(rid, decision)
-                grant_id = decision.approval_request_id if new_task else None
+                grant_id = decision.approval_request_id  # set when an approval let this message through
             if not new_task and method in ("SendMessage", "GetTask", "CancelTask"):
                 task_id = params.get("id") if method != "SendMessage" else params["message"]["taskId"]
                 if not self.owns(p, agent_id, task_id):
