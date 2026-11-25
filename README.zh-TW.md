@@ -32,22 +32,22 @@ Keycloak :18080  選用，真的 Keycloak（keycloak/docker-compose.yml）
 | `poc/agw_config.py` | 把 `config/policy.json` 轉成 agentgateway 的設定（CEL 規則），兩種 Gateway 共用同一份政策 |
 | `poc/registry.py` + `poc/search.py` | Agent 目錄、搜尋（關鍵字，有裝套件時再加上語意向量）、Task 對應表（SQLite）、會等待的 Task resource |
 | `poc/policy.py` + `config/policy.json` | 政策規則；檔案改了會自動重新載入 |
-| `poc/agents/` | A2A 1.0 server 和四個示範 Agent（IT 服務台、晨會報表分析、費用簽核、隱藏的資安鑑識），以及 `sdk_agent.py`：用官方 A2A SDK 寫的請假 Agent |
+| `poc/agents/` | A2A 1.0 server 和四個示範 Agent（IT 服務台、晨會報表分析、費用簽核、隱藏的資安鑑識），以及 `sdk_agent.py`：用官方 A2A SDK 寫的請假 Agent，和 `consult.py`：一個 Agent 怎麼經過 Gateway 請教另一個 Agent |
 | `poc/idp.py` + `config/users.json` | 假的使用者、群組、角色，以及 token exchange 規則 |
 | `poc/keycloak_realm.py` + `keycloak/` | 用同一份設定產生的 Keycloak realm，以及啟動它的 compose 檔 |
 | `poc/pdp.py` + `poc/approvals.py` + `poc/notify.py` | A2A 呼叫的政策決策服務（兩種 Gateway 共用）、核准申請和核准通知 |
-| `poc/txn.py` | Transaction Token 服務：每個請求一張簽章過的 token，把使用者、runtime、用途帶過每一跳 |
+| `poc/txn.py` | Transaction Token 服務：每個請求一張簽章過的 token，把使用者、runtime、用途和中間委派過的 Agent 帶過每一跳 |
 | `poc/tck_sut.py` | 給官方 A2A TCK（相容性測試工具）測試用的 A2A server 設定 |
 | `poc/keycloak_delegation.py` | Keycloak 委派的設定，以及委派測試用的瀏覽器式登入 |
 | `poc/common/trace.py` | 每一段都帶著 W3C trace context，寫到 `var/traces.jsonl`，也可以用 OTLP 送出 |
-| `tests/` | 34 個驗收測試（搜尋、授權、核准、transaction token、非同步 Task、trace、SDK Agent）、6 個 A2A 相容性測試、6 個 Keycloak 委派測試 |
+| `tests/` | 49 個驗收測試（搜尋、授權、核准、transaction token、Agent 請教 Agent、非同步 Task、trace、SDK Agent）、6 個 A2A 相容性測試、2 個搜尋測試、6 個 Keycloak 委派測試 |
 
 所有 Agent 的資料都是模擬的，不會碰到任何真實系統。
 
 ## 怎麼跑
 
 ```bash
-python -m poc demo          # 跑 11 個情境，最後印出一條完整 trace
+python -m poc demo          # 跑 12 個情境，最後印出一條完整 trace
 python -m unittest -v       # 約 20 秒；需要選用套件或 Keycloak 的測試會自動略過
 ```
 
@@ -64,6 +64,7 @@ demo 會看到：
 9. `cancel_task` 會取消 Task；讀取逾時則不會。
 10. Agent 端出錯會變成 `FAILED`，不會被包成一段看起來正常的文字。
 11. bob 輸入「下禮拜想休息兩天」。這句話裡沒有任何字出現在 Agent Card 上，但語意搜尋找得到請假 Agent（用官方 A2A SDK 寫的）。它反問要請哪幾天，拿到日期後送出申請。（需要選用套件）
+12. alice 要報表分析，但說她的報表帳號被鎖了。報表 Agent 經過 Gateway 請教 IT 服務台 Agent（同一筆交易），把對方的回覆放進報告裡。
 
 其他指令：
 
@@ -138,7 +139,15 @@ python -m poc approve APR-1A2B3C --as carol           # 或加 --reject
 python -m poc ask dave "幫我申請 3000 元交通費報銷"   # 放行一次
 ```
 
-申請人不能核准自己的申請，沒有核准資格的人也不能核准；申請還在等待時再問一次，會拿到同一個編號。一次核准只能用一次，期限一小時。搜尋結果會把這個 Agent 標成 `approval_required`；核准後、還沒用掉之前會標成 `allowed`。
+申請人不能核准自己的申請，沒有核准資格的人也不能核准；申請還在等待時再問一次，會拿到同一個編號。搜尋結果會把這個 Agent 標成 `approval_required`；核准後、還沒用掉之前會標成 `allowed`。
+
+一次核准只對一則完全相同的請求有效，不是對整個 Agent（這個做法參考 agentes.chat 的 tool gateway）：
+
+- 核准會記下目標 Agent、要接續的 Task（如果有）和訊息內容的 SHA-256，以及給核准人看的文字（`python -m poc approvals` 裡的 `summary`，通知裡也會寫）。每次送出都會變的編號不算在內，所以原樣再送一次會對得上。
+- 只有那一則訊息能用，一次，一小時內。dave 核准的是「800 元 計程車」，之後改成「80000 元 計程車」就是新的請求，要重新核准。拒絕訊息會寫出他手上的核准對應哪一則請求，換句話說的 AI 助理可以照原樣再送一次。
+- 回答 Agent 的追問也要另外核准。費用 Agent 問 dave 金額時，金額正是 carol 要看到的內容，所以 dave 的回答會開一張新的核准申請，寫明是哪個 Task、多少錢。
+- 送出核准過的訊息時會重新檢查權限，核准不會蓋過之後的變更：等待期間 dave 被拿掉可以申請核准的群組，或這個 Agent 對他變成隱藏，他就會被拒絕（或被告知沒有這個 Agent），而且核准不會被用掉。
+- 沒人處理的申請 24 小時後失效。
 
 通知：申請一建立，所有能核准的人都會收到一則通知；核准或拒絕後，申請人也會收到。通知會進收件匣（`python -m poc inbox --as carol`，或 PDP 的 `GET /notifications`）。設定 `POC_APPROVAL_WEBHOOK` 為 Slack 或 Mattermost 的 incoming webhook 網址，每則通知也會用 JSON（有 `text` 欄位）送過去。送失敗會重試最多 5 次、間隔越來越長，所以聊天服務掛掉只會讓通知晚到，不會弄丟。誰能核准是查 `config/users.json`；正式環境應該查公司的目錄服務。
 
@@ -187,6 +196,17 @@ POC_IDP=keycloak python -m unittest tests.test_keycloak_delegation -v
 - 每個 span 都記錄交易編號，就算分成好幾條 trace，也能用同一個編號把稽核紀錄串起來。
 
 以上每一點都有測試，四種 IdP/Gateway 組合都通過。這裡的 Txn-Token 服務是我們自己照草案寫的小型實作，Keycloak 和 agentgateway 目前都還沒有內建。
+
+## Agent 請教 Agent
+
+Agent 可以代表同一個使用者，請另一個 Agent 幫忙（`poc/agents/base.py` 的 `ctx.consult(agent_id, text)`）。示範裡，使用者說報表帳號被鎖時，報表 Agent 會去問 IT 服務台。這個呼叫一定經過 Gateway：
+
+1. Agent 把收到的 token（audience 是 `agent:<自己>`）以 client `agent:<自己>` 換成給 Gateway 的 token。模擬 IdP 和 Keycloak realm 裡每個 Agent 都有這個 client，而且只能換發寄給自己的 token。
+2. 帶著這張 token 和收到的 Txn-Token，呼叫 Gateway 上另一個 Agent 的 A2A 路由。
+3. Gateway 向 Txn-Token 服務申請替換 token（草案 7.4 節）：交易、使用者、runtime 不變，把呼叫的 Agent 加進 `tctx.agents`。只有 Gateway 能申請替換。
+4. 政策把呼叫的 Agent 當成呼叫者，套用它自己的 `delegation` 規則（報表 Agent 可以問 IT 服務台；IT 服務台不能問任何人）。它會拒絕循環（已經在鏈上的 Agent，包含 runtime 對應的 Agent），也會拒絕超過 `config/policy.json` 裡 `delegation_limits.max_agent_depth` 的鏈（預設 2：一個 Agent 問第二個，第二個還能再問一個）。鏈上每個 Agent 都還要符合使用者本人的權限。
+
+每個 span 都記錄委派鏈（`agent_chain`）和交易編號。測試涵蓋完整流程、沒有委派規則的 Agent、循環、層數上限、沒帶 Txn-Token 的呼叫，以及 Agent 想自己申請替換 token。限制：Gateway 相信收到的 token 裡的鏈，所以 Agent 如果留著之前某個 Task 的 token（鏈比較短），在它有效期間（最多 5 分鐘）可以拿來重用。
 
 ## 在 Jaeger 看完整的 trace
 
@@ -269,6 +289,6 @@ TCK 也會經過兩種 Gateway 各跑一次（`python -m poc.tck_sut --via-gatew
 - 語意搜尋用的是小模型，門檻是在五個 Agent 上手動調的，沒有在大型目錄上測過。
 - Gateway 把 Task 的擁有者記在記憶體裡。重啟後，舊 Task 的 resource 會被拒絕；Registry 的對應表則會保留。
 - 沒有 streaming、push notification、MCP Tasks。核准是透過一個簡單的 HTTP API 和 CLI 處理，有收件匣和 webhook 通知，但沒有核准網頁。
-- Transaction token 依據的是還在變動的 IETF 草案。替換 token（某一跳要求一張權限更小的）沒有實作。
+- Transaction token 依據的是還在變動的 IETF 草案。替換 token 只用來記錄 Agent 的委派；某一跳不能要求一張權限更小的。
 - MCP 傳輸只回一般 JSON，沒有 SSE stream。
 - 全部在同一個 process 裡用 thread 執行（啟用時另外加上 agentgateway 的 process）。各元件之間本來就走 HTTP，要拆成獨立服務並不難。如果直接砍掉 Python process 而不是按 Ctrl+C，agentgateway 的 process 可能會留著。

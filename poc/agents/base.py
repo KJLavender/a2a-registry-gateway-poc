@@ -58,6 +58,7 @@ class TaskRecord:
         }
         self.owner = owner
         self.traceparent = traceparent
+        self.credentials: tuple[str, str] = ("", "")  # (access token, Txn-Token) of the request; for consult()
         self.cond = threading.Condition()
         self.pending_input: str | None = None
         self.cancel_requested = False
@@ -94,9 +95,11 @@ class TaskRecord:
 class TaskContext:
     """What an agent handler sees: the request text plus progress/input/artifact controls."""
 
-    def __init__(self, record: TaskRecord, speed: float):
+    def __init__(self, record: TaskRecord, speed: float, agent_id: str = "", consult: "Consult | None" = None):
         self._rec = record
         self.speed = speed
+        self._agent_id = agent_id
+        self._consult = consult
 
     @property
     def text(self) -> str:
@@ -141,6 +144,22 @@ class TaskContext:
                 {"artifactId": new_id(), "name": name, "description": description, "parts": parts})
             self._rec.cond.notify_all()
 
+    def consult(self, agent_id: str, text: str) -> dict[str, Any]:
+        """Ask another agent, through the gateway, on behalf of the same user; returns its final Task.
+
+        The gateway applies the delegation rules to this agent as the caller, refuses cycles and chains that
+        are too deep, and raises RpcError (POLICY_DENIED) when it refuses.
+        """
+        self._check()
+        if self._consult is None:
+            raise RuntimeError("this agent was started without a way to reach the gateway")
+        rec = self._rec
+        with trace.span(f"consult {agent_id}", f"agent:{self._agent_id}", rec.traceparent,
+                        task_id=rec.id) as sp:
+            task = self._consult(self._agent_id, *rec.credentials, agent_id, text, sp.traceparent)
+            sp.set(state=task["status"]["state"])
+            return task
+
     def sleep(self, seconds: float) -> None:
         """Simulated work that still reacts to cancellation promptly."""
         rec = self._rec
@@ -153,14 +172,18 @@ class TaskContext:
 
 
 Handler = Callable[[TaskContext], str]
+# (calling agent, access token, Txn-Token, target agent, text, traceparent) -> the target's final Task
+Consult = Callable[[str, str, str, str, str, "str | None"], dict[str, Any]]
 # Optional: answer a new message directly with a Message (no task) by returning one; None = make a task
 DirectReply = Callable[[dict[str, Any]], "dict[str, Any] | None"]
 
 
 class A2AAgent:
     def __init__(self, agent_id: str, card: dict[str, Any], handler: Handler, verify: Verifier, speed: float = 1.0,
-                 verify_txn: Callable[[str], dict[str, Any]] | None = None, direct_reply: DirectReply | None = None):
+                 verify_txn: Callable[[str], dict[str, Any]] | None = None, direct_reply: DirectReply | None = None,
+                 consult: Consult | None = None):
         self.agent_id = agent_id
+        self.consult = consult
         self.direct_reply = direct_reply
         self.card_template = card
         self.handler = handler
@@ -217,8 +240,10 @@ class A2AAgent:
         with trace.span(f"a2a {method}", self.component, req.headers.get("traceparent"),
                         user=claims.get("preferred_username", claims["sub"]),
                         origin=txn.get("tctx", {}).get("origin_client"), txn=txn.get("txn"),
-                        purpose=txn.get("scope"), delegation_path=" > ".join(actor_chain(claims))) as sp:
+                        purpose=txn.get("scope"), delegation_path=" > ".join(actor_chain(claims)),
+                        agent_chain=" > ".join(txn.get("tctx", {}).get("agents", []))) as sp:
             try:
+                claims = dict(claims, _credentials=(req.bearer or "", req.headers.get("txn-token", "")))
                 result = handler(camel_keys(msg.get("params") or {}), claims, sp)
             except RpcError as e:
                 sp.set(error_code=e.code)
@@ -257,6 +282,7 @@ class A2AAgent:
             if reply is not None:
                 return {"message": reply}
             rec = TaskRecord(message, claims["sub"], sp.traceparent)
+            rec.credentials = claims.get("_credentials", ("", ""))
             with self._lock:
                 self.tasks[rec.id] = rec
             threading.Thread(target=self._run, args=(rec,), name=f"{self.agent_id}-{rec.id[:8]}", daemon=True).start()
@@ -291,7 +317,7 @@ class A2AAgent:
         return {"tasks": tasks, "nextPageToken": "", "pageSize": len(tasks), "totalSize": len(tasks)}
 
     def _run(self, rec: TaskRecord) -> None:
-        ctx = TaskContext(rec, self.speed)
+        ctx = TaskContext(rec, self.speed, self.agent_id, self.consult)
         with trace.span("agent.execute", self.component, rec.traceparent, task_id=rec.id) as sp:
             started = time.time()
             try:

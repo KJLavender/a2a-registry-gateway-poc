@@ -88,9 +88,20 @@ class PolicyStore:
 
     def invocation(self, p: Principal, agent_id: str) -> Decision:
         data = self.data
-        caller = self.caller_agent(p.origin_client)
-        if caller is None:
+        start = self.caller_agent(p.origin_client)
+        if start is None:
             return Decision(DENY, f"unknown caller runtime {p.origin_client!r}", "runtimes")
+        # When an agent asks another agent, that agent is the caller the delegation rules apply to
+        caller = p.agent_chain[-1] if p.agent_chain else start
+        if p.agent_chain:
+            chain = [start, *p.agent_chain]
+            if agent_id in chain:
+                return Decision(DENY, f"{agent_id!r} is already in this chain ({' > '.join(chain)}): no cycles",
+                                "delegation_limits.no_cycles")
+            limit = data.get("delegation_limits", {}).get("max_agent_depth", 2)
+            if len(p.agent_chain) > limit:
+                return Decision(DENY, f"agents may delegate at most {limit} levels deep "
+                                      f"({' > '.join(chain)} > {agent_id})", "delegation_limits.max_agent_depth")
         targets = data["delegation"].get(caller)
         if targets is None or not ("*" in targets or agent_id in targets):
             return Decision(DENY, f"caller agent {caller!r} may not delegate to {agent_id!r}", f"delegation.{caller}")

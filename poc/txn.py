@@ -18,6 +18,12 @@ Routes
   GET  /jwks     signing keys
   POST /token    RFC 8693 request with requested_token_type=urn:ietf:params:oauth:token-type:txn_token.
                  Only edge workloads may ask, and only with a token from outside the trust domain.
+                 With subject_token_type=txn_token it issues a replacement (draft §7.4): same txn, user and
+                 origin, a new purpose, and `tctx.agents` extended by the agent that is delegating.
+
+When an agent asks another agent for help, it calls the gateway with its own token for the gateway and the
+Txn-Token it received. The gateway replaces that token, adding the calling agent to `tctx.agents`. The
+policy reads that list to refuse cycles (an agent already in the chain) and chains that are too deep.
 """
 from __future__ import annotations
 
@@ -42,7 +48,7 @@ TRUST_DOMAIN = "poc.internal"
 HEADER = "txn-token"  # request header names are lower-cased by poc.common.web
 TTL = 300
 EDGE_WORKLOADS = ("agent-gateway",)  # may ask for Txn-Tokens
-INTERNAL_WORKLOADS = ("agent-gateway", "agent-registry")  # their calls must carry one
+INTERNAL_WORKLOADS = ("agent-gateway", "agent-registry")  # their calls must carry one (as do agents')
 EDGE_A2A = "a2a"  # purpose of an A2A call that came straight from outside (no MCP tool behind it)
 
 # Which A2A calls a transaction may make, by the purpose it was minted for. The registry acts on
@@ -54,6 +60,11 @@ _PURPOSE_A2A = {
     "resources/read": lambda rpc: rpc.get("method") == "GetTask",
     EDGE_A2A: lambda rpc: True,
 }
+
+
+def is_internal(actor: str) -> bool:
+    """A workload inside the trust domain: the registry, the gateway, or an agent (client agent:<id>)."""
+    return actor in INTERNAL_WORKLOADS or actor.startswith("agent:")
 
 
 def purpose_allows(purpose: str, rpc: Any) -> bool:
@@ -106,14 +117,17 @@ class TxnTokenService:
                 form.get("client_secret", "").encode("utf-8"), self.settings.client_secret(client_id).encode("utf-8")):
             return _oauth_error(401, "invalid_client", "only edge workloads may request transaction tokens")
         if form.get("grant_type") != TOKEN_EXCHANGE or form.get("requested_token_type") != TXN_TOKEN_TYPE \
-                or form.get("audience") != TRUST_DOMAIN or form.get("subject_token_type") != ACCESS_TOKEN_TYPE:
+                or form.get("audience") != TRUST_DOMAIN \
+                or form.get("subject_token_type") not in (ACCESS_TOKEN_TYPE, TXN_TOKEN_TYPE):
             return _oauth_error(400, "invalid_request", "expected a token exchange for a txn_token "
                                                         f"with audience {TRUST_DOMAIN}")
+        if form["subject_token_type"] == TXN_TOKEN_TYPE:
+            return self._replace(form, client_id)
         try:
             p = Principal.from_claims(self.verify(form.get("subject_token", ""), "agent-gateway"))
         except TokenError as e:
             return _oauth_error(400, "invalid_grant", f"subject token: {e}")
-        if p.immediate_actor in INTERNAL_WORKLOADS:
+        if is_internal(p.immediate_actor):
             # A token minted for an internal hop already belongs to a transaction; minting a new one
             # would let that hop pick its own context.
             return _oauth_error(400, "invalid_grant", "subject token comes from inside the trust domain")
@@ -128,8 +142,30 @@ class TxnTokenService:
             "tctx": {"origin_client": p.origin_client, "user": p.username},
             "rctx": {k: v for k, v in rctx.items() if isinstance(v, str)} if isinstance(rctx, dict) else {},
         }
+        return self._issue(claims)
+
+    def _issue(self, claims: dict[str, Any]) -> Response:
         return Response(200, {"access_token": jwt.encode(claims, self.key, typ=JWT_TYP),
-                              "issued_token_type": TXN_TOKEN_TYPE, "token_type": "N_A", "expires_in": TTL})
+                              "issued_token_type": TXN_TOKEN_TYPE, "token_type": "N_A",
+                              "expires_in": max(0, claims["exp"] - int(time.time()))})
+
+    def _replace(self, form: dict[str, str], client_id: str) -> Response:
+        """A replacement keeps txn, sub and origin; it may only add the delegating agent and a purpose."""
+        try:
+            old = jwt.decode(form.get("subject_token", ""),
+                             lambda kid: self.key.public_jwk() if kid == self.key.kid else None,
+                             audience=TRUST_DOMAIN, issuer=self.settings.txn_url, typ=JWT_TYP)
+            details = json.loads(jwt.unb64url(form.get("request_details", "")))
+        except (TokenError, ValueError) as e:
+            return _oauth_error(400, "invalid_grant", f"subject txn token: {e}")
+        agent = details.get("delegating_agent") if isinstance(details, dict) else None
+        if not isinstance(agent, str) or not agent:
+            return _oauth_error(400, "invalid_request", "request_details.delegating_agent is required")
+        now = int(time.time())
+        tctx = dict(old["tctx"], agents=[*old["tctx"].get("agents", []), agent])
+        claims = dict(old, iat=now, exp=min(old["exp"], now + TTL), scope=form.get("scope", ""), req_wl=client_id,
+                      tctx=tctx)  # never outlives the token it replaces
+        return self._issue(claims)
 
 
 def _oauth_error(status: int, code: str, description: str) -> Response:
@@ -153,7 +189,8 @@ class TxnVerifier:
         if claims.get("sub") != principal.sub:
             raise TokenError("transaction token belongs to another user")
         return dataclasses.replace(principal, origin_claim=str(claims["tctx"].get("origin_client", "")),
-                                   txn=claims["txn"], purpose=str(claims.get("scope", "")))
+                                   txn=claims["txn"], purpose=str(claims.get("scope", "")),
+                                   agent_chain=tuple(str(a) for a in claims["tctx"].get("agents", [])))
 
 
 class TxnGate:
@@ -161,6 +198,8 @@ class TxnGate:
 
     - A caller from inside the trust domain (a token minted for the registry) must bring the Txn-Token
       of the request it is working on.
+    - An agent calling another agent brings the Txn-Token it received; the gateway replaces it so that
+      the token says this agent is now delegating.
     - A caller from outside gets a new one; anything it sent in the header is ignored.
     """
 
@@ -180,11 +219,25 @@ class TxnGate:
             raise TokenError(f"transaction token refused: {body}")
         return body["access_token"]
 
+    def replace(self, txn_token: str, delegating_agent: str, purpose: str) -> str:
+        details = jwt.b64url(json.dumps({"delegating_agent": delegating_agent}).encode())
+        status, body, _ = http("POST", f"{self.settings.txn_url}/token", form={
+            "grant_type": TOKEN_EXCHANGE, "client_id": self.client_id, "client_secret": self.client_secret,
+            "requested_token_type": TXN_TOKEN_TYPE, "audience": TRUST_DOMAIN, "scope": purpose,
+            "subject_token": txn_token, "subject_token_type": TXN_TOKEN_TYPE, "request_details": details,
+        })
+        if status != 200 or not isinstance(body, dict):
+            raise TokenError(f"replacement transaction token refused: {body}")
+        return body["access_token"]
+
     def establish(self, p: Principal, bearer: str, incoming: str, edge_purpose: str) -> tuple[Principal, str]:
-        if p.immediate_actor in INTERNAL_WORKLOADS:
+        actor = p.immediate_actor
+        if is_internal(actor):
             if not incoming:
                 raise TokenError("calls from inside the trust domain need a Txn-Token")
-            token = incoming
+            self.verifier.bind(p, incoming)  # same user before anything is replaced
+            token = self.replace(incoming, actor.removeprefix("agent:"), edge_purpose) \
+                if actor.startswith("agent:") else incoming
         else:
             token = self.mint(bearer, edge_purpose)
         return self.verifier.bind(p, token), token

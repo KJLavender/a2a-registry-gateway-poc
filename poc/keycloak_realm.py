@@ -118,10 +118,8 @@ def build(settings: Settings) -> dict[str, Any]:
     })
     clients.append(_service_client("agent-registry", secrets["agent-registry"], ["agent-gateway"],
                                    service_account=True))  # only used to show a wrong actor is refused
-    for client_id in agent_clients:  # audiences only; they never request tokens
-        clients.append({"clientId": client_id, "enabled": True, "publicClient": False,
-                        "standardFlowEnabled": False, "directAccessGrantsEnabled": False,
-                        "defaultClientScopes": [], "optionalClientScopes": []})
+    for client_id in agent_clients:  # an agent swaps the token it got for one to the gateway (asking agents)
+        clients.append(_service_client(client_id, directory["clients"]["agent:*"]["secret"], ["agent-gateway"]))
 
     return {
         "realm": "poc", "enabled": True,

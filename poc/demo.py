@@ -99,6 +99,8 @@ def run(settings: Settings, only: str | None = None) -> None:
 
     scenario("11", "官方 A2A SDK 寫的 Agent（人資請假）一樣被找到、被管控；這句話跟 Agent Card 沒有共同關鍵字",
              sdk_agent)
+    scenario("12", "Agent 請教 Agent：報表 Agent 經過 Gateway 請 IT 服務台協助（委派鏈記在 Transaction Token，限層數、禁循環）",
+             lambda: _show(runtime.ask(settings, "alice", "幫我分析今天晨會報表的良率異常（我的報表帳號被鎖了）")))
 
     if report_trace:
         _section("情境 2 的端到端 Trace（Frontend → Runtime → Gateway → Registry → Gateway → Agent）")

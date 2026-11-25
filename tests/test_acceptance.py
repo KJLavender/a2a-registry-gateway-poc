@@ -564,6 +564,102 @@ class FrameworkAgent(unittest.TestCase):
         self.assertEqual(body["error"]["code"], -32001)  # TaskNotFound: the SDK keeps users' tasks apart
 
 
+class AgentsAskingAgents(unittest.TestCase):
+    """An agent asks another agent through the gateway; the Txn-Token records the chain of agents."""
+
+    RPC = {"jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+           "params": {"message": text_message(ROLE_USER, "請協助"), "configuration": {"returnImmediately": True}}}
+
+    @staticmethod
+    def call_as_agent(user: str, chain: list[str], caller: str, target: str) -> tuple[int, dict]:
+        """What `caller` sends when it asks `target`, after the agents in `chain` delegated to reach it."""
+        user_token = login(SETTINGS, user, "orchestrator-runtime")
+        gate = TxnGate(SETTINGS)
+        txn = gate.mint(user_token, "invoke_agent")
+        for agent in chain:
+            txn = gate.replace(txn, agent, "a2a")
+        caller_token = exchange(exchange(user_token, "agent-gateway", f"agent:{caller}"), f"agent:{caller}",
+                                "agent-gateway")
+        return a2a_post(f"/agents/{target}/a2a", caller_token, AgentsAskingAgents.RPC, txn)
+
+    @staticmethod
+    def with_policy(change):
+        path = SETTINGS.config_dir / "policy.json"
+        original = path.read_text(encoding="utf-8")
+        policy = json.loads(original)
+        change(policy)
+        path.write_text(json.dumps(policy), encoding="utf-8")
+        time.sleep(1.5 if AGW else 0.05)
+        return original
+
+    @staticmethod
+    def restore(original: str) -> None:
+        (SETTINGS.config_dir / "policy.json").write_text(original, encoding="utf-8")
+        time.sleep(1.5 if AGW else 0.05)
+
+    def test_report_agent_asks_the_helpdesk(self):
+        alice = mcp_for("alice")  # name the agent: with semantic search the helpdesk itself may rank first
+        inv, is_error = alice.call_tool("invoke_agent", {"agent_id": "report-analyst",
+                                                         "message": "幫我分析今天晨會報表，但我的報表帳號被鎖了"})
+        self.assertFalse(is_error, inv)
+        view = read_until_done(alice, inv["resource_uri"])
+        self.assertEqual(view["state"], "TASK_STATE_COMPLETED")
+        helpdesk = next(a for a in view["artifacts"] if a["name"] == "it-helpdesk")
+        self.assertIn("解鎖", helpdesk["text"])
+        spans = traceview.load(SETTINGS.trace_file)
+        invoke = next(s for s in spans if s["name"] == "registry invoke_agent"
+                      and s["attributes"].get("task_id") == inv["task_id"])
+        asked = [s for s in spans if s["component"] == "agent:it-helpdesk" and s["name"] == "a2a SendMessage"
+                 and s["attributes"].get("txn") == invoke["attributes"]["txn"]]  # one transaction throughout
+        self.assertEqual(asked[0]["attributes"]["agent_chain"], "report-analyst")
+
+    def test_an_agent_needs_its_own_delegation_rule(self):
+        # report-analyst may ask it-helpdesk (policy.json); it-helpdesk may ask nobody
+        status, body = self.call_as_agent("alice", [], "it-helpdesk", "report-analyst")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["data"]["rule"], "delegation.it-helpdesk")
+
+    def test_cycles_are_refused(self):
+        original = self.with_policy(lambda p: p["delegation"].update({"it-helpdesk": ["*"]}))
+        try:  # report-analyst asked it-helpdesk, which now asks report-analyst back
+            status, body = self.call_as_agent("alice", ["report-analyst"], "it-helpdesk", "report-analyst")
+            self.assertEqual(status, 403)
+            self.assertEqual(body["error"]["data"]["rule"], "delegation_limits.no_cycles")
+        finally:
+            self.restore(original)
+
+    def test_chains_have_a_maximum_depth(self):
+        def limit_one(p):
+            p["delegation"].update({"it-helpdesk": ["*"]})
+            p["delegation_limits"]["max_agent_depth"] = 1
+        original = self.with_policy(limit_one)
+        try:  # report-analyst > it-helpdesk > expense-approver is two agents delegating
+            status, body = self.call_as_agent("alice", ["report-analyst"], "it-helpdesk", "expense-approver")
+            self.assertEqual(status, 403)
+            self.assertEqual(body["error"]["data"]["rule"], "delegation_limits.max_agent_depth")
+        finally:
+            self.restore(original)
+        original = self.with_policy(lambda p: p["delegation"].update({"it-helpdesk": ["*"]}))
+        try:  # with the default limit (2) the chain is fine; alice's own rights decide
+            status, body = self.call_as_agent("alice", ["report-analyst"], "it-helpdesk", "expense-approver")
+            self.assertEqual(body["error"]["data"]["rule"], "agents.expense-approver.invoke")
+        finally:
+            self.restore(original)
+
+    def test_agents_cannot_call_without_a_transaction_or_rewrite_the_chain(self):
+        user_token = login(SETTINGS, "alice", "orchestrator-runtime")
+        caller_token = exchange(exchange(user_token, "agent-gateway", "agent:report-analyst"),
+                                "agent:report-analyst", "agent-gateway")
+        self.assertEqual(a2a_post("/agents/it-helpdesk/a2a", caller_token, self.RPC)[0], 401)
+        txn = TxnGate(SETTINGS).mint(user_token, "invoke_agent")
+        status, body, _ = http("POST", f"{SETTINGS.txn_url}/token", form={  # only the gateway may replace
+            "grant_type": TOKEN_EXCHANGE, "requested_token_type": "urn:ietf:params:oauth:token-type:txn_token",
+            "audience": "poc.internal", "subject_token": txn,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:txn_token",
+            "client_id": "agent:report-analyst", "client_secret": SETTINGS.client_secret("agent:report-analyst")})
+        self.assertEqual((status, body["error"]), (401, "invalid_client"))
+
+
 class BoundApprovals(unittest.TestCase):
     """An approval covers one exact message; access is checked again when the approved message is sent."""
 

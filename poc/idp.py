@@ -18,7 +18,7 @@ from poc.common import jwt
 from poc.common.identity import ACCESS_TOKEN_TYPE, TOKEN_EXCHANGE
 from poc.common.jwt import TokenError
 from poc.common.web import Request, Response
-from poc.settings import Settings
+from poc.settings import Settings, client_entry
 
 USER_TOKEN_TTL = 8 * 3600
 EXCHANGED_TOKEN_TTL = 300
@@ -68,13 +68,17 @@ class IdentityProvider:
         })
 
     def exchange(self, client_id: str, client_secret: str, subject_token: str, audience: str) -> str:
-        client = self.clients.get(client_id, {})
+        try:
+            client = client_entry(self.clients, client_id)
+        except KeyError:
+            client = {}
         if client.get("type") != "service" or not hmac.compare_digest(client.get("secret", ""), client_secret):
             raise ExchangeError("invalid_client", "client authentication failed")
         rules = client.get("exchange", {})
+        allowed_from = [client_id if a == "{self}" else a for a in rules.get("from", [])]  # agent:* -> its own id
         try:
             claims = jwt.decode(subject_token, lambda kid: self.key.public_jwk() if kid == self.key.kid else None,
-                                audience=rules.get("from", []), issuer=self.settings.issuer)
+                                audience=allowed_from, issuer=self.settings.issuer)
         except TokenError as e:
             raise ExchangeError("invalid_grant", f"subject token rejected: {e}") from e
         if not any(fnmatch.fnmatchcase(audience, pattern) for pattern in rules.get("to", [])):

@@ -6,7 +6,9 @@ import re
 from typing import Any, Callable
 
 from poc import llm
-from poc.agents.base import A2AAgent, TaskContext
+from poc.agents.base import A2AAgent, Consult, TaskContext
+from poc.common.a2a import message_text
+from poc.common.web import RpcError
 from poc.common.identity import Verifier
 
 
@@ -84,6 +86,15 @@ def report_analyst(ctx: TaskContext) -> str:
         ctx.progress("連線報表資料庫")
         ctx.sleep(0.5)
         raise RuntimeError("報表資料庫連線逾時（模擬故障）")
+    if any(k in ctx.text for k in ("帳號被鎖", "登不進")):
+        # Agents asking agents: the report system needs the user's account, so ask the IT helpdesk first.
+        ctx.progress("報表系統要求重新登入，先請 IT 服務台協助")
+        try:
+            helpdesk = ctx.consult("it-helpdesk", "使用者的報表系統 AD 帳號被鎖住了，請說明怎麼解鎖。")
+            note = message_text(helpdesk["status"].get("message")) or helpdesk["status"]["state"]
+        except (RpcError, OSError, RuntimeError) as e:  # refused by policy, or the helpdesk is down
+            note = f"IT 服務台這次沒有回覆：{getattr(e, 'message', e)}"
+        ctx.artifact("it-helpdesk", text=note, description="請教 IT 服務台的結果")
     for label, seconds in (("讀取晨會報表資料 (1/3)", 1.5), ("計算 KPI 與異常偵測 (2/3)", 1.5), ("整理分析摘要 (3/3)", 1.0)):
         ctx.progress(label)
         ctx.sleep(seconds)
@@ -186,6 +197,7 @@ AGENTS = {
 }
 
 
-def build_agents(verify: Verifier, speed: float, verify_txn: Callable[[str], dict[str, Any]] | None = None
-                 ) -> list[A2AAgent]:
-    return [A2AAgent(agent_id, card, handler, verify, speed, verify_txn) for agent_id, (card, handler) in AGENTS.items()]
+def build_agents(verify: Verifier, speed: float, verify_txn: Callable[[str], dict[str, Any]] | None = None,
+                 consult: Consult | None = None) -> list[A2AAgent]:
+    return [A2AAgent(agent_id, card, handler, verify, speed, verify_txn, consult=consult)
+            for agent_id, (card, handler) in AGENTS.items()]

@@ -208,7 +208,7 @@ class AgentGateway:
         p, txn_token = established
         with trace.span(f"gateway a2a {method}", COMPONENT, req.headers.get("traceparent"), agent_id=agent_id,
                         user=p.username, delegation_path=" > ".join(p.actors), txn=p.txn,
-                        origin=p.origin_client, purpose=p.purpose) as sp:
+                        origin=p.origin_client, purpose=p.purpose, agent_chain=" > ".join(p.agent_chain)) as sp:
             new_task = is_new_task(msg)
             if not self.policy.visible(p, agent_id):
                 sp.set(policy_effect="deny", reason="agent hidden from user")

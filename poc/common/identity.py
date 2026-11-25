@@ -81,6 +81,7 @@ class Principal:
     origin_claim: str = ""
     txn: str = ""
     purpose: str = ""
+    agent_chain: tuple[str, ...] = ()  # agents that delegated on the way here, first one first (Txn-Token)
 
     @property
     def origin_client(self) -> str:

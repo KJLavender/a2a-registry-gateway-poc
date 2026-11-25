@@ -165,7 +165,7 @@ class PolicyDecisionPoint:
         method = rpc.get("method") if isinstance(rpc, dict) else None
         with trace.span(f"pdp authz {method}", COMPONENT, req.headers.get("traceparent"),
                         agent_id=agent_id, user=p.username, txn=p.txn, origin=p.origin_client,
-                        purpose=p.purpose) as sp:
+                        purpose=p.purpose, agent_chain=" > ".join(p.agent_chain)) as sp:
             if not self.policy.visible(p, agent_id):
                 sp.set(policy_effect="deny", reason="agent hidden from user")
                 return NOT_FOUND

@@ -36,6 +36,10 @@
       "invoke": {"allow_groups": ["employees"]}
     }
   },
+  "delegation_limits": {
+    "_comment": "Agents asking agents: how many agents may delegate in one chain. A cycle is always refused.",
+    "max_agent_depth": 2
+  },
   "delegation": {
     "orchestrator": ["*"],
     "report-analyst": ["it-helpdesk"],

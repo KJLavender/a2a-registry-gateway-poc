@@ -13,6 +13,7 @@ from http.server import ThreadingHTTPServer
 
 from poc import agw_config
 from poc.agents.base import A2AAgent
+from poc.agents.consult import make_consult
 from poc.agents.demo import build_agents
 from poc.common import trace
 from poc.common.identity import TokenExchanger, make_verifier
@@ -150,7 +151,7 @@ def _start(settings: Settings, servers: list[ThreadingHTTPServer]) -> Stack:
     servers.append(serve(TxnTokenService(settings, verify), settings.host, settings.txn_port))
 
     verify_txn = TxnVerifier(settings).verify
-    agents = build_agents(verify, settings.speed, verify_txn)
+    agents = build_agents(verify, settings.speed, verify_txn, make_consult(settings))
     for agent in agents:
         agent.base_url = settings.agent_url(agent.agent_id)
         servers.append(serve(agent, settings.host, settings.agent_ports[agent.agent_id]))

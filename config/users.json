@@ -20,6 +20,12 @@
       "type": "service",
       "secret": "registry-dev-secret",
       "exchange": {"from": ["agent-registry"], "to": ["agent-gateway"]}
+    },
+    "agent:*": {
+      "_comment": "Every agent (client agent:<id>): swaps the token it received for one to call the gateway.",
+      "type": "service",
+      "secret": "agent-dev-secret",
+      "exchange": {"from": ["{self}"], "to": ["agent-gateway"]}
     }
   }
 }

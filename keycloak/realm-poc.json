@@ -483,46 +483,151 @@
       "clientId": "agent:it-helpdesk",
       "enabled": true,
       "publicClient": false,
+      "secret": "agent-dev-secret",
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
-      "defaultClientScopes": [],
-      "optionalClientScopes": []
+      "serviceAccountsEnabled": false,
+      "attributes": {
+        "standard.token.exchange.enabled": "true"
+      },
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "poc-claims"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-agent-gateway",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "included.client.audience": "agent-gateway"
+          }
+        }
+      ]
     },
     {
       "clientId": "agent:report-analyst",
       "enabled": true,
       "publicClient": false,
+      "secret": "agent-dev-secret",
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
-      "defaultClientScopes": [],
-      "optionalClientScopes": []
+      "serviceAccountsEnabled": false,
+      "attributes": {
+        "standard.token.exchange.enabled": "true"
+      },
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "poc-claims"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-agent-gateway",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "included.client.audience": "agent-gateway"
+          }
+        }
+      ]
     },
     {
       "clientId": "agent:expense-approver",
       "enabled": true,
       "publicClient": false,
+      "secret": "agent-dev-secret",
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
-      "defaultClientScopes": [],
-      "optionalClientScopes": []
+      "serviceAccountsEnabled": false,
+      "attributes": {
+        "standard.token.exchange.enabled": "true"
+      },
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "poc-claims"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-agent-gateway",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "included.client.audience": "agent-gateway"
+          }
+        }
+      ]
     },
     {
       "clientId": "agent:security-forensics",
       "enabled": true,
       "publicClient": false,
+      "secret": "agent-dev-secret",
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
-      "defaultClientScopes": [],
-      "optionalClientScopes": []
+      "serviceAccountsEnabled": false,
+      "attributes": {
+        "standard.token.exchange.enabled": "true"
+      },
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "poc-claims"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-agent-gateway",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "included.client.audience": "agent-gateway"
+          }
+        }
+      ]
     },
     {
       "clientId": "agent:hr-leave",
       "enabled": true,
       "publicClient": false,
+      "secret": "agent-dev-secret",
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
-      "defaultClientScopes": [],
-      "optionalClientScopes": []
+      "serviceAccountsEnabled": false,
+      "attributes": {
+        "standard.token.exchange.enabled": "true"
+      },
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "poc-claims"
+      ],
+      "optionalClientScopes": [],
+      "protocolMappers": [
+        {
+          "name": "aud-agent-gateway",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "included.client.audience": "agent-gateway"
+          }
+        }
+      ]
     }
   ]
 }

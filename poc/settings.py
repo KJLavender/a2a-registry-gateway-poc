@@ -1,6 +1,7 @@
 """Runtime settings shared by every component (ports, URLs, secrets, paths)."""
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import platform
@@ -98,4 +99,14 @@ class Settings:
         return self.var_dir / "traces.jsonl"
 
     def client_secret(self, client_id: str) -> str:
-        return self.load("users.json")["clients"][client_id]["secret"]
+        return client_entry(self.load("users.json")["clients"], client_id)["secret"]
+
+
+def client_entry(clients: dict[str, Any], client_id: str) -> dict[str, Any]:
+    """A client by exact id, else by a pattern such as "agent:*"."""
+    if client_id in clients:
+        return clients[client_id]
+    for pattern, entry in clients.items():
+        if "*" in pattern and fnmatch.fnmatchcase(client_id, pattern):
+            return entry
+    raise KeyError(client_id)

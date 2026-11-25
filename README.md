@@ -32,22 +32,22 @@ Keycloak :18080  optional, the real thing (keycloak/docker-compose.yml)
 | `poc/agw_config.py` | Turns `config/policy.json` into an agentgateway config (CEL rules), so both gateways use one policy file |
 | `poc/registry.py` + `poc/search.py` | Agent catalog, search (keywords, plus embeddings when installed), task correlation (SQLite), blocking task resource |
 | `poc/policy.py` + `config/policy.json` | Policy rules. The file is reloaded when it changes |
-| `poc/agents/` | A2A 1.0 server and four demo agents (IT helpdesk, KPI report analyst, expense approver, hidden security forensics), plus `sdk_agent.py`, a leave-request agent built on the official A2A SDK |
+| `poc/agents/` | A2A 1.0 server and four demo agents (IT helpdesk, KPI report analyst, expense approver, hidden security forensics), plus `sdk_agent.py`, a leave-request agent built on the official A2A SDK, and `consult.py`, how one agent asks another through the gateway |
 | `poc/idp.py` + `config/users.json` | Fake users, groups and roles; token exchange rules |
 | `poc/keycloak_realm.py` + `keycloak/` | Keycloak realm generated from the same config, and a compose file to run it |
 | `poc/pdp.py` + `poc/approvals.py` + `poc/notify.py` | Policy decision point for A2A calls (used by both gateways), approval requests and their notifications |
-| `poc/txn.py` | Transaction Token Service: one signed token per request that carries the user, the runtime and the purpose through every hop |
+| `poc/txn.py` | Transaction Token Service: one signed token per request that carries the user, the runtime, the purpose and the agents that delegated through every hop |
 | `poc/tck_sut.py` | The PoC's A2A server set up for the official A2A TCK (compatibility test kit) |
 | `poc/keycloak_delegation.py` | Keycloak delegation setup and a browser-style login for the delegation tests |
 | `poc/common/trace.py` | W3C trace context across every hop, written to `var/traces.jsonl` and optionally sent over OTLP |
-| `tests/` | 34 acceptance tests (search, authorization, approvals, transaction tokens, async tasks, tracing, the SDK agent), 6 A2A conformance tests and 6 Keycloak delegation tests |
+| `tests/` | 49 acceptance tests (search, authorization, approvals, transaction tokens, agents asking agents, async tasks, tracing, the SDK agent), 6 A2A conformance tests, 2 search tests and 6 Keycloak delegation tests |
 
 All agent data is simulated. No real system is touched.
 
 ## Try it
 
 ```bash
-python -m poc demo          # runs 11 scenarios and prints one full trace
+python -m poc demo          # runs 12 scenarios and prints one full trace
 python -m unittest -v       # about 20 seconds; tests that need optional parts or Keycloak are skipped
 ```
 
@@ -64,6 +64,7 @@ What the demo shows:
 9. `cancel_task` cancels; a read that times out does not.
 10. An agent error becomes `FAILED`, not a normal-looking text answer.
 11. bob writes "下禮拜想休息兩天" ("I want two days off next week"). No word in it appears in any agent card, but semantic search finds the leave agent, which runs on the official A2A SDK. It asks which dates, gets them, and files the request. (Needs the optional packages.)
+12. alice asks for the report but says her report account is locked. The report agent asks the IT helpdesk agent through the gateway, under the same transaction, and adds its answer to the report.
 
 Other commands:
 
@@ -138,7 +139,15 @@ python -m poc approve APR-1A2B3C --as carol           # or --reject
 python -m poc ask dave "幫我申請 3000 元交通費報銷"   # allowed once
 ```
 
-Requesters cannot approve their own request, people without the approver rule cannot approve, and asking again while a request is pending returns the same id. An approval covers one invocation within an hour. Search results show the agent as `approval_required`, and as `allowed` while an approval is waiting to be used.
+Requesters cannot approve their own request, people without the approver rule cannot approve, and asking again while a request is pending returns the same id. Search results show the agent as `approval_required`, and as `allowed` while an approval is waiting to be used.
+
+An approval covers one exact request, not the agent in general (the idea comes from agentes.chat's tool gateway):
+
+- The approval stores a SHA-256 of the target agent, the task being continued (if any) and the content of the message, plus the text the approver sees (`summary` in `python -m poc approvals`, and in the notification). Ids that change on every send are left out, so resending the same request matches.
+- Only that exact message may use it, once, within an hour. If dave is approved for "800 元 計程車" and then asks for "80000 元 計程車", that is a new request needing a new approval. The refusal names the request his approval covers, so an AI assistant that reworded it can send it again as approved.
+- Answers to an agent's question need their own approval too. If the expense agent asks dave for the amount, the amount is part of what carol has to see, so dave's answer opens an approval request that names the task and the amount.
+- Access is checked again when the approved message is sent, so an approval never overrides a later change: if dave loses the group that may ask for approval, or the agent is hidden from him while he waits, he is refused (or told the agent does not exist) and the approval is not used up.
+- Requests nobody decides expire after 24 hours.
 
 Notifications: when a request is opened, everyone who may decide it gets one, and the requester gets one when it is decided. They land in an inbox (`python -m poc inbox --as carol`, or `GET /notifications` on the PDP). Set `POC_APPROVAL_WEBHOOK` to a Slack or Mattermost incoming webhook URL and each one is also posted there as JSON with a `text` field. A failed post is retried up to 5 times with growing waits, so a chat outage delays a notification instead of losing it. Approvers are looked up in `config/users.json`; a real setup would ask the company directory.
 
@@ -187,6 +196,17 @@ A request goes runtime > gateway > registry > gateway > agent. Each hop gets its
 - Every span records the transaction id, so one id ties the audit trail together even across separate traces.
 
 Tests cover each of these, in all four IdP/gateway combinations. The Txn-Token service here is our own small implementation of a draft standard; neither Keycloak nor agentgateway ships one yet.
+
+## Agents asking agents
+
+An agent can ask another agent for help on behalf of the same user (`ctx.consult(agent_id, text)` in `poc/agents/base.py`). In the demo the report agent asks the IT helpdesk when the user says their report account is locked. The call always goes through the gateway:
+
+1. The agent swaps the token it received (audience `agent:<itself>`) for one to the gateway, as client `agent:<itself>`. Each agent has that client in the mock IdP and in the Keycloak realm, and may only swap tokens addressed to itself.
+2. It calls the gateway's A2A route for the other agent with that token and the Txn-Token it received.
+3. The gateway asks the Txn-Token service for a replacement token (draft section 7.4): same transaction, user and runtime, with the calling agent added to `tctx.agents`. Only the gateway may ask for replacements.
+4. The policy treats the calling agent as the caller, so its own `delegation` rule applies (the report agent may ask the helpdesk; the helpdesk may ask nobody). It refuses a cycle (an agent already in the chain, counting the runtime's agent) and a chain deeper than `delegation_limits.max_agent_depth` in `config/policy.json` (2 by default: one agent asks a second, which may ask one more). The user's own rights still apply to every agent in the chain.
+
+Every span records the chain (`agent_chain`) and the transaction id. Tests cover the full path, an agent without its own delegation rule, a cycle, the depth limit, a call without a Txn-Token, and an agent trying to get a replacement token itself. Limit: the gateway trusts the chain in the token it receives, so an agent that keeps a token from an earlier task with a shorter chain could reuse it while that token is valid (5 minutes at most).
 
 ## See whole traces in Jaeger
 
@@ -269,6 +289,6 @@ Ports are set in `poc/settings.py` and `config/agents.json` (gateway 18000, regi
 - Semantic search uses a small model tuned by hand on five agents. It has not been tested on a large catalog.
 - The gateway keeps task ownership in memory. After a restart, old task resources are refused until the task is recreated. The registry's correlation table survives restarts.
 - No streaming, push notifications or MCP Tasks. Approvals are decided through a small HTTP API and CLI, with notifications to an inbox and a webhook; there is no approval web page.
-- Transaction tokens follow an IETF draft that may still change. Replacement tokens (a hop asking for a narrower one) are not implemented.
+- Transaction tokens follow an IETF draft that may still change. Replacement tokens are used only to record agents delegating; a hop cannot ask for a narrower one.
 - MCP transport answers with plain JSON; there is no SSE stream.
 - It runs as one process with threads (plus the agentgateway process when enabled). Each component already talks to the others over HTTP, so they can be split into separate services. If the Python process is killed instead of stopped with Ctrl+C, the agentgateway process may keep running.
